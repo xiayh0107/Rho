@@ -196,7 +196,21 @@ plot(
             <div class="environment-card">
               <strong>Render</strong>
               <div id="renderCapability" class="environment-contract">Render tooling not checked yet.</div>
+              <div id="renderDocumentHint" class="environment-hint">Open an `.Rmd` or `.qmd` document to render.</div>
               <button id="renderDocumentButton" type="button" class="environment-action">Render Active Document</button>
+              <div id="renderResultCard" class="render-result-card hidden">
+                <div class="render-result-header">
+                  <strong id="renderResultTitle">Last Render</strong>
+                  <span id="renderResultState" class="revision-badge">idle</span>
+                </div>
+                <p id="renderResultSummary" class="environment-contract">No render has been run yet.</p>
+                <div id="renderResultPath" class="environment-hint"></div>
+                <div class="render-result-actions">
+                  <button id="renderOpenSourceButton" type="button">Open Source</button>
+                  <button id="renderShowProblemsButton" type="button">Show Problems</button>
+                  <button id="renderShowPlotsButton" type="button">Show Plots</button>
+                </div>
+              </div>
             </div>
           </div>
           <div class="environment-head"><span>Name</span><span>Type</span><span>Size</span></div>

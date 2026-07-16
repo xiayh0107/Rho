@@ -15,6 +15,7 @@ const state = {
   environment: null,
   selectedObjectName: null,
   selectedObjectDetail: null,
+  lastRender: null,
   runs: [],
   problems: [],
   agentTurns: [],
@@ -364,6 +365,25 @@ function mockEnvironmentSnapshot() {
     },
     workspace: state.revision,
   };
+}
+
+function updateLastRender(result) {
+  state.lastRender = result ? { ...result } : null;
+}
+
+function activeDocumentCanRender() {
+  return Boolean(state.activeDocument && /\.(rmd|qmd)$/i.test(state.activeDocument));
+}
+
+function renderDocumentHintText() {
+  if (!state.activeDocument) return "Open an `.Rmd` or `.qmd` document to render.";
+  if (!activeDocumentCanRender()) return `Current document \`${state.activeDocument}\` is not renderable.`;
+  return `Ready to render \`${state.activeDocument}\`.`;
+}
+
+function latestRenderProblem() {
+  if (!state.lastRender?.sourcePath) return null;
+  return state.problems.find((problem) => problem.execution_mode === "render" && problem.source_path === state.lastRender.sourcePath) || null;
 }
 
 function mockInspectObject(name) {
@@ -1973,6 +1993,14 @@ function renderExecution(response, request, origin = "USER") {
     addConsole(origin, execution.error.message, "error");
   }
   if (execution.kind === "render") {
+    updateLastRender({
+      ok: Boolean(execution.ok),
+      tool: execution.tool || null,
+      sourcePath: execution.source_path || request?.sourcePath || null,
+      outputPath: execution.output_path || null,
+      phase: execution.error?.phase || null,
+      message: execution.error?.message || execution.stdout || null,
+    });
     if (execution.ok) {
       addConsole("SYSTEM", `Render completed · ${execution.output_path || execution.source_path || "output"}`);
     } else if (execution.error?.message) {
@@ -1984,6 +2012,7 @@ function renderExecution(response, request, origin = "USER") {
         documentVersion: request?.documentVersion ?? null,
       });
     }
+    renderEnvironmentSummary();
   }
   for (const wrapped of response.events || []) {
     const event = wrapped.event || wrapped;
@@ -2108,6 +2137,9 @@ function renderEnvironmentSummary() {
   if (!environment) {
     $("#environmentContract").textContent = "Environment snapshot unavailable.";
     $("#renderCapability").textContent = "Render tooling not checked yet.";
+    $("#renderDocumentHint").textContent = renderDocumentHintText();
+    $("#renderDocumentButton").disabled = true;
+    renderLastRenderCard();
     return;
   }
   const renv = environment.renv || {};
@@ -2123,6 +2155,46 @@ function renderEnvironmentSummary() {
     render.can_render_qmd ? "Quarto ready" : "Quarto unavailable",
     render.can_render_rmd ? "R Markdown ready" : "R Markdown unavailable",
   ].join(" · ");
+  $("#renderDocumentHint").textContent = renderDocumentHintText();
+  const path = state.activeDocument || "";
+  const renderable = activeDocumentCanRender();
+  const canRender = path.toLowerCase().endsWith(".qmd")
+    ? Boolean(render.can_render_qmd)
+    : path.toLowerCase().endsWith(".rmd")
+      ? Boolean(render.can_render_rmd)
+      : false;
+  $("#renderDocumentButton").disabled = !renderable || !canRender;
+  renderLastRenderCard();
+}
+
+function renderLastRenderCard() {
+  const card = $("#renderResultCard");
+  const render = state.lastRender;
+  card.className = "render-result-card";
+  if (!render) {
+    card.classList.add("hidden");
+    $("#renderResultTitle").textContent = "Last Render";
+    $("#renderResultState").textContent = "idle";
+    $("#renderResultSummary").textContent = "No render has been run yet.";
+    $("#renderResultPath").textContent = "";
+    for (const id of ["renderOpenSourceButton", "renderShowProblemsButton", "renderShowPlotsButton"]) {
+      $(`#${id}`).disabled = true;
+    }
+    return;
+  }
+  card.classList.remove("hidden");
+  card.classList.add(render.ok ? "success" : "error");
+  $("#renderResultTitle").textContent = render.tool ? `Last Render · ${render.tool}` : "Last Render";
+  $("#renderResultState").textContent = render.ok ? "completed" : (render.phase || "failed");
+  $("#renderResultSummary").textContent = render.ok
+    ? `Rendered ${render.sourcePath || "document"} successfully.`
+    : `${render.message || "Render failed."}`;
+  $("#renderResultPath").textContent = render.ok
+    ? `Output: ${render.outputPath || "unavailable"}`
+    : `Source: ${render.sourcePath || "unknown"}${render.phase ? ` · phase ${render.phase}` : ""}`;
+  $("#renderOpenSourceButton").disabled = !render.sourcePath;
+  $("#renderShowProblemsButton").disabled = !latestRenderProblem();
+  $("#renderShowPlotsButton").disabled = !state.plots.some((plot) => plot.source_path === render.sourcePath);
 }
 
 function previewSummary(detail) {
@@ -2229,6 +2301,14 @@ async function renderActiveDocumentFile() {
     }, "USER");
     await Promise.all([loadRunData(), refreshEnvironment()]);
   } catch (error) {
+    updateLastRender({
+      ok: false,
+      tool: null,
+      sourcePath: path,
+      outputPath: null,
+      phase: "transport",
+      message: String(error),
+    });
     addProblem(String(error), "", {
       sourcePath: path,
       executionMode: "render",
@@ -2236,6 +2316,7 @@ async function renderActiveDocumentFile() {
     toast(String(error), true);
   } finally {
     $("#renderDocumentButton").disabled = false;
+    renderEnvironmentSummary();
   }
 }
 
@@ -2652,6 +2733,18 @@ $("#agentInput").addEventListener("keydown", (event) => {
 $("#refreshEnvironment").addEventListener("click", refreshEnvironment);
 $("#environmentSearch").addEventListener("input", renderEnvironment);
 $("#renderDocumentButton").addEventListener("click", renderActiveDocumentFile);
+$("#renderOpenSourceButton").addEventListener("click", async () => {
+  if (!state.lastRender?.sourcePath) return;
+  await openDocument(state.lastRender.sourcePath);
+});
+$("#renderShowProblemsButton").addEventListener("click", () => {
+  if (!latestRenderProblem()) return;
+  switchDockTab("problems");
+});
+$("#renderShowPlotsButton").addEventListener("click", () => {
+  if (!state.lastRender?.sourcePath) return;
+  switchDockTab("plots");
+});
 $("#toggleDockMaximize").addEventListener("click", toggleDockMaximize);
 window.addEventListener("resize", () => {
   for (const panel of ["left", "right", "dock"]) {
