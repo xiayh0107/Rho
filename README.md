@@ -53,6 +53,8 @@ Release changes are recorded in `NEWS.md`; the active post-prototype roadmap
 is in `docs/development-roadmap.md`.
 The implementation handoff for the remaining `0.2.x` work is in
 `docs/0.2x-agent-handoff.md`.
+The verified Windows toolchain, packaging procedure and acceptance checklist
+are documented in `docs/windows-build-environment.md`.
 
 ## Windows prototype
 
