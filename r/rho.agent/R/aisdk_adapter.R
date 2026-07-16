@@ -7,12 +7,20 @@ rho_agent_set_workspace_identity <- function(identity) {
 }
 
 rho_broker_tool_request <- function(type, arguments = list()) {
+  payload <- list(
+    arguments = arguments,
+    expected_workspace = .rho_agent_state$workspace_identity
+  )
+  if (identical(type, "workspace.execute")) {
+    approval <- .rho_agent_state$pending_approval
+    .rho_agent_state$pending_approval <- NULL
+    if (!is.null(approval$request_id)) {
+      payload$approval_request_id <- approval$request_id
+    }
+  }
   response <- rho_agent_request(
     type,
-    list(
-      arguments = arguments,
-      expected_workspace = .rho_agent_state$workspace_identity
-    )
+    payload
   )
   if (is.list(response$workspace)) {
     rho_agent_set_workspace_identity(response$workspace)
@@ -112,6 +120,15 @@ rho_create_aisdk_hooks <- function(connection = .rho_agent_state$connection) {
         ),
         connection = connection
       )
+      if (isTRUE(response$approved)) {
+        .rho_agent_state$pending_approval <- list(
+          request_id = response$approval_request_id %||% response$request_id,
+          tool = tool$name,
+          arguments = args
+        )
+      } else {
+        .rho_agent_state$pending_approval <- NULL
+      }
       isTRUE(response$approved)
     },
     on_tool_start = function(tool, args) {

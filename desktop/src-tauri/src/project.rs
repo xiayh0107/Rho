@@ -39,8 +39,10 @@ pub struct ProjectDocumentSession {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProjectSessionSnapshot {
     pub open_documents: Vec<ProjectDocumentSession>,
+    pub closed_documents: Vec<ProjectDocumentSession>,
     pub active_document: Option<String>,
     pub panels: PanelSizes,
 }
@@ -268,6 +270,15 @@ fn normalize_project_root(path: &Path, create_if_missing: bool) -> Result<PathBu
 
 pub fn project_path(root: &Path, relative: &str) -> Result<PathBuf> {
     ensure!(!relative.trim().is_empty(), "Project file path is empty");
+    let relative = Path::new(relative);
+    ensure!(relative.is_relative(), "Project file path must be relative");
+    ensure!(
+        relative.components().all(|component| matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )),
+        "Project file path contains a parent, root or drive prefix"
+    );
     let candidate = root.join(relative);
     let normalized = if candidate.exists() {
         candidate.canonicalize()?
@@ -275,12 +286,18 @@ pub fn project_path(root: &Path, relative: &str) -> Result<PathBuf> {
         let parent = candidate
             .parent()
             .context("Project file path has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        parent.canonicalize()?.join(
-            candidate
-                .file_name()
-                .context("Project file path has no file name")?,
-        )
+        let mut existing_ancestor = parent;
+        while !existing_ancestor.exists() {
+            existing_ancestor = existing_ancestor
+                .parent()
+                .context("Project file path has no existing ancestor")?;
+        }
+        let canonical_ancestor = existing_ancestor.canonicalize()?;
+        ensure!(
+            canonical_ancestor.starts_with(root),
+            "Project file path escapes project root"
+        );
+        canonical_ancestor.join(candidate.strip_prefix(existing_ancestor)?)
     };
     ensure!(
         normalized.starts_with(root),
@@ -357,11 +374,12 @@ pub fn relative_project_path(root: &Path, path: &Path) -> Result<String> {
 }
 
 pub fn stable_project_key(root: &Path) -> String {
-    root.to_string_lossy()
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in root.to_string_lossy().replace('\\', "/").as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -402,6 +420,7 @@ mod tests {
                 cursor_end: 9,
                 draft_content: Some("x <- 1".to_string()),
             }],
+            closed_documents: Vec::new(),
             active_document: Some("analysis.R".to_string()),
             panels: PanelSizes {
                 left: Some(200),
@@ -443,5 +462,25 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("missing");
         assert!(normalize_existing_project_root(&path).is_err());
+    }
+
+    #[test]
+    fn rejected_project_path_does_not_create_outside_directories() {
+        let directory = TempDir::new().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let root = project.canonicalize().unwrap();
+        let outside = directory.path().join("outside");
+
+        assert!(project_path(&root, "../outside/analysis.R").is_err());
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn project_session_key_has_fixed_windows_safe_length() {
+        let root = PathBuf::from(format!(r"C:\{}", "nested\\".repeat(80)));
+        let key = stable_project_key(&root);
+        assert_eq!(key.len(), 16);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 }

@@ -145,10 +145,42 @@ rho_environment_snapshot <- function() {
   )
 }
 
-bounded_columns <- function(names, limit = 8L) {
+bounded_text <- function(value, max_chars = 256L) {
+  value <- as.character(value %||% "")
+  if (nchar(value, type = "bytes") <= as.integer(max_chars)) {
+    return(value)
+  }
+  paste0(substr(value, 1L, as.integer(max_chars)), "... [truncated]")
+}
+
+bounded_scalar <- function(value, max_chars = 256L) {
+  if (is.null(value) || !length(value)) {
+    return(NULL)
+  }
+  if (is.factor(value) || inherits(value, c("Date", "POSIXt"))) {
+    return(bounded_text(value[[1L]], max_chars = max_chars))
+  }
+  if (is.atomic(value) && length(value) == 1L) {
+    if (is.character(value)) {
+      return(bounded_text(value, max_chars = max_chars))
+    }
+    if (is.raw(value)) {
+      return(bounded_text(paste(format(value), collapse = ""), max_chars = max_chars))
+    }
+    return(unclass(value)[[1L]])
+  }
+  sprintf("<%s length=%d>", paste(class(value), collapse = "/"), length(value))
+}
+
+bounded_columns <- function(names, limit = 8L, max_chars = 128L) {
   names <- as.character(names %||% character())
   list(
-    values = head(names, as.integer(limit)),
+    values = vapply(
+      head(names, as.integer(limit)),
+      bounded_text,
+      character(1),
+      max_chars = max_chars
+    ),
     truncated = length(names) > as.integer(limit)
   )
 }
@@ -157,32 +189,48 @@ bounded_columns <- function(names, limit = 8L) {
   if (is.null(x)) y else x
 }
 
-preview_data_frame <- function(value, max_rows = 8L, max_cols = 8L) {
-  preview <- utils::head(value, as.integer(max_rows))
-  if (ncol(preview) > as.integer(max_cols)) {
-    preview <- preview[, seq_len(as.integer(max_cols)), drop = FALSE]
-  }
+preview_data_frame <- function(value,
+                               max_rows = 8L,
+                               max_cols = 8L,
+                               max_cell_chars = 256L) {
+  column_limit <- min(ncol(value), as.integer(max_cols))
+  preview <- utils::head(
+    value[, seq_len(column_limit), drop = FALSE],
+    as.integer(max_rows)
+  )
   rows <- lapply(seq_len(nrow(preview)), function(index) {
-    as.list(preview[index, , drop = FALSE])
+    row <- lapply(preview, function(column) {
+      bounded_scalar(column[[index]], max_chars = max_cell_chars)
+    })
+    names(row) <- colnames(preview)
+    row
   })
   list(
     kind = "tabular",
     columns = bounded_columns(colnames(value), max_cols),
-    column_types = vapply(value, function(column) paste(class(column), collapse = "/"), character(1)),
+    column_types = vapply(
+      preview,
+      function(column) bounded_text(paste(class(column), collapse = "/"), 128L),
+      character(1)
+    ),
     rows = rows,
     truncated_rows = nrow(value) > as.integer(max_rows),
     truncated_columns = ncol(value) > as.integer(max_cols)
   )
 }
 
-preview_matrix <- function(value, max_rows = 8L, max_cols = 8L) {
+preview_matrix <- function(value,
+                           max_rows = 8L,
+                           max_cols = 8L,
+                           max_cell_chars = 256L) {
   row_limit <- min(nrow(value), as.integer(max_rows))
   col_limit <- min(ncol(value), as.integer(max_cols))
   preview <- value[seq_len(row_limit), seq_len(col_limit), drop = FALSE]
-  rows <- apply(preview, 1, function(row) as.list(row))
-  if (!is.list(rows) || !length(rows)) {
-    rows <- list()
-  }
+  rows <- lapply(seq_len(row_limit), function(row_index) {
+    lapply(seq_len(col_limit), function(column_index) {
+      bounded_scalar(preview[row_index, column_index], max_chars = max_cell_chars)
+    })
+  })
   list(
     kind = "array",
     columns = bounded_columns(colnames(value), max_cols),
@@ -193,19 +241,24 @@ preview_matrix <- function(value, max_rows = 8L, max_cols = 8L) {
   )
 }
 
-preview_vector <- function(value, limit = 12L) {
+preview_vector <- function(value, limit = 12L, max_item_chars = 256L) {
   raw_values <- utils::head(value, as.integer(limit))
   list(
     kind = "vector",
-    values = as.list(raw_values),
+    values = lapply(raw_values, bounded_scalar, max_chars = max_item_chars),
     truncated = length(value) > as.integer(limit)
   )
 }
 
-preview_list <- function(value, limit = 12L) {
+preview_list <- function(value, limit = 12L, max_item_chars = 128L) {
   names <- names(value)
   item_names <- if (is.null(names)) paste0("[[", seq_along(value), "]]") else names
-  item_names <- head(item_names, as.integer(limit))
+  item_names <- vapply(
+    head(item_names, as.integer(limit)),
+    bounded_text,
+    character(1),
+    max_chars = max_item_chars
+  )
   list(
     kind = "list",
     items = item_names,

@@ -2,6 +2,7 @@
 
 mod project;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use project::{
 use rho_core::{BrokerState, ExecutionOrigin};
 use rho_kernel::{ArkLaunchConfig, ArkSession};
 use rho_server::coordinator::{
-    ApprovalResponseInput, PendingApprovalRegistry, bootstrap_bridge, dispatch_workspace_request,
-    run_agent_turn,
+    ApprovalResponseInput, CoordinatorRuntime, PendingApprovalRegistry, bootstrap_bridge,
+    dispatch_workspace_request, run_agent_turn,
 };
 use rho_store::{
     AgentTurnDetail, AgentTurnDraft, AgentTurnEventDraft, AgentTurnSummary, ApprovalRequestSummary,
@@ -25,7 +26,7 @@ use rho_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use uuid::Uuid;
 
 const BRIDGE_STATE: &str = include_str!("../../../r/rho.bridge/R/state.R");
@@ -44,19 +45,15 @@ struct RuntimeConfig {
     store_path: PathBuf,
 }
 
-struct RuntimeContext {
-    broker: BrokerState,
-    store: Store,
-}
-
 struct AppState {
     config: RuntimeConfig,
     project_store: ProjectSessionStore,
     project_root: RwLock<PathBuf>,
     project_watcher: Mutex<Option<ProjectWatcherControl>>,
     session: RwLock<Option<Arc<ArkSession>>>,
-    context: Mutex<Option<Arc<Mutex<RuntimeContext>>>>,
+    context: Mutex<Option<Arc<Mutex<CoordinatorRuntime>>>>,
     approvals: Arc<PendingApprovalRegistry>,
+    agent_tasks: Arc<Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>>,
 }
 
 #[derive(Serialize)]
@@ -201,10 +198,19 @@ async fn project_write_file(
     let root = state.project_root.read().await.clone();
     let file = project_path(&root, &path).map_err(display_error)?;
     ensure_editable_file(&file).map_err(display_error)?;
+    let context = active_context(&state).await.map_err(display_error)?;
+    let mut context = context.lock().await;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(display_error)?;
     }
     std::fs::write(file, content).map_err(display_error)?;
+    context.broker.project_changed();
+    let identity = context.broker.identity().clone();
+    context
+        .store
+        .save_identity(&identity)
+        .map_err(display_error)?;
+    drop(context);
     project_state(state).await
 }
 
@@ -220,10 +226,19 @@ async fn project_create_file(
     if file.exists() {
         return Err(format!("Project file already exists: {path}"));
     }
+    let context = active_context(&state).await.map_err(display_error)?;
+    let mut context = context.lock().await;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(display_error)?;
     }
     std::fs::write(file, content).map_err(display_error)?;
+    context.broker.project_changed();
+    let identity = context.broker.identity().clone();
+    context
+        .store
+        .save_identity(&identity)
+        .map_err(display_error)?;
+    drop(context);
     project_state(state).await
 }
 
@@ -235,7 +250,7 @@ async fn execute_r(request: ExecuteRequest, state: State<'_, AppState>) -> Resul
     let session = active_session(&state).await.map_err(display_error)?;
     let context = active_context(&state).await.map_err(display_error)?;
     let mut context = context.lock().await;
-    let RuntimeContext { broker, store } = &mut *context;
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": {
             "code": request.code,
@@ -262,7 +277,7 @@ async fn snapshot_workspace(state: State<'_, AppState>) -> Result<Value, String>
     let session = active_session(&state).await.map_err(display_error)?;
     let context = active_context(&state).await.map_err(display_error)?;
     let mut context = context.lock().await;
-    let RuntimeContext { broker, store } = &mut *context;
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": {},
         "expected_workspace": broker.identity()
@@ -287,7 +302,7 @@ async fn inspect_object(
     let session = active_session(&state).await.map_err(display_error)?;
     let context = active_context(&state).await.map_err(display_error)?;
     let mut context = context.lock().await;
-    let RuntimeContext { broker, store } = &mut *context;
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": {
             "name": request.name
@@ -311,15 +326,29 @@ async fn render_document(
     request: RenderRequest,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
+    let root = state.project_root.read().await.clone();
+    let source_path = request.path.clone();
+    let file = project_path(&root, &source_path).map_err(display_error)?;
+    let extension = file
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "rmd" | "qmd") {
+        return Err("Render only supports project .Rmd and .qmd files".to_string());
+    }
+    if !file.is_file() {
+        return Err(format!("Render source does not exist: {source_path}"));
+    }
     let session = active_session(&state).await.map_err(display_error)?;
     let context = active_context(&state).await.map_err(display_error)?;
     let mut context = context.lock().await;
-    let RuntimeContext { broker, store } = &mut *context;
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": {
-            "path": request.path,
+            "path": file.to_string_lossy(),
             "format": request.format,
-            "source_path": request.path,
+            "source_path": source_path,
             "execution_mode": "render",
             "document_version": request.document_version
         },
@@ -338,7 +367,10 @@ async fn render_document(
 }
 
 #[tauri::command]
-async fn list_runs(limit: Option<usize>, state: State<'_, AppState>) -> Result<Vec<RunSummary>, String> {
+async fn list_runs(
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RunSummary>, String> {
     read_store(&state)
         .map_err(display_error)?
         .list_runs(limit)
@@ -357,7 +389,10 @@ async fn list_problems(
 }
 
 #[tauri::command]
-async fn get_run_detail(run_id: String, state: State<'_, AppState>) -> Result<Option<RunDetail>, String> {
+async fn get_run_detail(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<RunDetail>, String> {
     read_store(&state)
         .map_err(display_error)?
         .get_run_detail(&run_id)
@@ -386,13 +421,17 @@ async fn retry_run(run_id: String, state: State<'_, AppState>) -> Result<Value, 
         .map_err(display_error)?
         .context(format!("Run not found: {run_id}"))
         .map_err(display_error)?;
-    let mut arguments: Value = serde_json::from_str(&detail.arguments_json).map_err(display_error)?;
+    let mut arguments: Value =
+        serde_json::from_str(&detail.arguments_json).map_err(display_error)?;
     let object = arguments
         .as_object_mut()
         .context("Stored run arguments are invalid")
         .map_err(display_error)?;
-    object.insert("parent_run_id".to_string(), Value::String(detail.run_id.clone()));
-    let RuntimeContext { broker, store } = &mut *context;
+    object.insert(
+        "parent_run_id".to_string(),
+        Value::String(detail.run_id.clone()),
+    );
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": arguments,
         "expected_workspace": broker.identity()
@@ -463,13 +502,14 @@ async fn run_agent(
     let rscript = state.config.rscript.clone();
     let agent_package = state.config.agent_package.clone();
     let task_turn_id = turn_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut context_guard = context.lock().await;
-        let RuntimeContext { broker, store } = &mut *context_guard;
+    let agent_tasks = state.agent_tasks.clone();
+    let task_agent_tasks = agent_tasks.clone();
+    let (registered_tx, registered_rx) = oneshot::channel();
+    let task = tauri::async_runtime::spawn(async move {
+        let _ = registered_rx.await;
         let _ = run_agent_turn(
             session.as_ref(),
-            broker,
-            store,
+            context,
             rscript,
             agent_package,
             model,
@@ -479,9 +519,16 @@ async fn run_agent(
             approvals,
         )
         .await;
-        drop(context_guard);
-        let _ = app.emit("rho://agent-turn-updated", json!({ "turn_id": task_turn_id }));
+        let _ = app.emit(
+            "rho://agent-turn-updated",
+            json!({ "turn_id": task_turn_id.clone() }),
+        );
+        task_agent_tasks.lock().await.remove(&task_turn_id);
     });
+    let mut tasks = agent_tasks.lock().await;
+    tasks.insert(turn_id.clone(), task);
+    drop(tasks);
+    let _ = registered_tx.send(());
     Ok(json!({
         "status": "started",
         "turn_id": turn_id
@@ -542,11 +589,13 @@ async fn respond_approval(
     }
     let pending = read_store(&state)
         .map_err(display_error)?
-        .list_approval_requests(Some(1), Some("waiting"))
+        .get_approval_request(&request.request_id)
         .map_err(display_error)?
-        .into_iter()
-        .find(|item| item.request_id == request.request_id)
-        .context(format!("Approval request not found or no longer waiting: {}", request.request_id))
+        .filter(|item| item.status == "waiting")
+        .context(format!(
+            "Approval request not found or no longer waiting: {}",
+            request.request_id
+        ))
         .map_err(display_error)?;
     let delivered = state
         .approvals
@@ -558,6 +607,20 @@ async fn respond_approval(
             },
         )
         .await;
+    if !delivered {
+        read_store(&state)
+            .map_err(display_error)?
+            .resolve_approval_request(
+                &request.request_id,
+                &rho_store::ApprovalDecisionRecord {
+                    decision: "cancel".to_string(),
+                    status: "interrupted".to_string(),
+                    reason: Some("Approval channel is no longer active.".to_string()),
+                    continuation_outcome: Some("agent_unavailable".to_string()),
+                },
+            )
+            .map_err(display_error)?;
+    }
     Ok(json!({
         "status": if delivered { "delivered" } else { "not_delivered" },
         "request_id": request.request_id,
@@ -581,8 +644,39 @@ async fn cancel_run(run_id: String, state: State<'_, AppState>) -> Result<Value,
 
 #[tauri::command]
 async fn restart_workspace(state: State<'_, AppState>) -> Result<WorkspaceStatus, String> {
-    state.context.lock().await.take();
-    state.session.write().await.take();
+    state
+        .approvals
+        .cancel_all("Workspace R is restarting.")
+        .await;
+    let tasks = {
+        let mut tasks = state.agent_tasks.lock().await;
+        tasks.drain().map(|(_, task)| task).collect::<Vec<_>>()
+    };
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+
+    let old_context = state.context.lock().await.take();
+    let old_session = state.session.write().await.take();
+    if let Some(session) = old_session.as_ref() {
+        let mut store = read_store(&state).map_err(display_error)?;
+        if let Some(run_id) = store.latest_active_run_id().map_err(display_error)? {
+            store.request_cancel(&run_id).map_err(display_error)?;
+            drop(store);
+            session.interrupt().await.map_err(display_error)?;
+        }
+    }
+    if let Some(context) = old_context.as_ref() {
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(15), context.lock())
+            .await
+            .map_err(|_| {
+                "Timed out waiting for the previous Workspace R run to stop".to_string()
+            })?;
+        drop(guard);
+    }
+    drop(old_session);
+    drop(old_context);
     let status = start_workspace(&state).await.map_err(display_error)?;
     let root = state.project_root.read().await.clone();
     sync_workspace_project_root(&state, &root)
@@ -600,8 +694,13 @@ async fn active_session(state: &AppState) -> Result<Arc<ArkSession>> {
         .context("Workspace R is not running")
 }
 
-async fn active_context(state: &AppState) -> Result<Arc<Mutex<RuntimeContext>>> {
-    state.context.lock().await.clone().context("Workspace context is not ready")
+async fn active_context(state: &AppState) -> Result<Arc<Mutex<CoordinatorRuntime>>> {
+    state
+        .context
+        .lock()
+        .await
+        .clone()
+        .context("Workspace context is not ready")
 }
 
 fn read_store(state: &AppState) -> Result<Store> {
@@ -632,6 +731,9 @@ async fn start_workspace(state: &AppState) -> Result<WorkspaceStatus> {
     store
         .recover_incomplete_agent_turns()
         .context("recovering incomplete agent turns after desktop restart")?;
+    store
+        .recover_incomplete_approvals()
+        .context("recovering incomplete approvals after desktop restart")?;
     let mut broker = BrokerState::new(format!("desktop_{}", Uuid::new_v4()));
     store.save_identity(broker.identity())?;
     bootstrap_bridge(
@@ -642,33 +744,32 @@ async fn start_workspace(state: &AppState) -> Result<WorkspaceStatus> {
     )
     .await?;
     let status = status_from(&state.config, &session, Some(broker.identity()))?;
-    *state.context.lock().await = Some(Arc::new(Mutex::new(RuntimeContext { broker, store })));
+    *state.context.lock().await = Some(Arc::new(Mutex::new(CoordinatorRuntime { broker, store })));
     *state.session.write().await = Some(session);
     Ok(status)
 }
 
 async fn request_run_interrupt(run_id: Option<String>, state: &AppState) -> Result<Value> {
     let session = active_session(state).await?;
-    let context = active_context(state).await?;
-    let target = {
-        let mut context = context.lock().await;
-        let RuntimeContext { broker: _, store } = &mut *context;
-        let run_id = match run_id {
-            Some(value) => value,
-            None => store
-                .latest_active_run_id()
-                .context("looking up active run")?
-                .context("No active run is available to interrupt")?,
-        };
-        ensure!(
-            store
-                .request_cancel(&run_id)
-                .context("marking run as cancel-requested")?,
-            "Run is not active: {run_id}"
-        );
-        run_id
+    let mut store = read_store(state)?;
+    let target = match run_id {
+        Some(value) => value,
+        None => store
+            .latest_active_run_id()
+            .context("looking up active run")?
+            .context("No active run is available to interrupt")?,
     };
-    session.interrupt().await.context("interrupting Workspace R")?;
+    ensure!(
+        store
+            .request_cancel(&target)
+            .context("marking run as cancel-requested")?,
+        "Run is not active: {target}"
+    );
+    drop(store);
+    session
+        .interrupt()
+        .await
+        .context("interrupting Workspace R")?;
     Ok(json!({
         "status": "interrupt_requested",
         "run_id": target
@@ -704,13 +805,13 @@ async fn sync_workspace_project_root(state: &AppState, root: &Path) -> Result<()
     let session = active_session(state).await?;
     let context = active_context(state).await?;
     let mut context = context.lock().await;
-    let RuntimeContext { broker, store } = &mut *context;
+    let CoordinatorRuntime { broker, store } = &mut *context;
     let payload = json!({
         "arguments": {"code": format!("setwd({})", serde_json::to_string(&root.to_string_lossy()).unwrap())},
         "expected_workspace": broker.identity()
     });
     dispatch_workspace_request(
-        "workspace.execute",
+        "workspace.set_project_root",
         &payload,
         ExecutionOrigin::System,
         session.as_ref(),
@@ -939,11 +1040,11 @@ async fn smoke_test(include_agent: bool) -> Result<Value> {
         object_found,
         "desktop smoke object was absent from Environment"
     );
+    let context = Arc::new(Mutex::new(CoordinatorRuntime { broker, store }));
     let agent = if include_agent {
         let result = run_agent_turn(
             &session,
-            &mut broker,
-            &mut store,
+            context.clone(),
             config.rscript.clone(),
             config.agent_package.clone(),
             "deepseek:deepseek-v4-flash".to_string(),
@@ -963,13 +1064,14 @@ async fn smoke_test(include_agent: bool) -> Result<Value> {
     } else {
         None
     };
+    let context = context.lock().await;
     Ok(json!({
         "type": "rho_desktop_smoke",
-        "workspace": broker.identity(),
+        "workspace": context.broker.identity(),
         "plot_count": plot_count,
         "environment_object_found": object_found,
         "agent": agent,
-        "event_count": store.event_count()?,
+        "event_count": context.store.event_count()?,
         "python_required": false
     }))
 }
@@ -1013,6 +1115,7 @@ fn main() {
                 session: RwLock::new(None),
                 context: Mutex::new(None),
                 approvals: Arc::new(PendingApprovalRegistry::default()),
+                agent_tasks: Arc::new(Mutex::new(HashMap::new())),
             });
             Ok(())
         })

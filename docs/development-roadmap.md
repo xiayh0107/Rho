@@ -1,7 +1,7 @@
 # Rho Development Roadmap
 
 Date: 2026-07-16
-Current baseline: `0.2.0-dev.1` Windows project-file prototype
+Current baseline: `0.2.0-dev.2` Windows workbench candidate
 
 Progress: `0.2.x` project-file foundation in progress. The first slice now
 provides a broker-safe project root, source file listing, multi-document

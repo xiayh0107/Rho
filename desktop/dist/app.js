@@ -1265,13 +1265,47 @@ function currentPanelSnapshot() {
 function buildSessionSnapshot() {
   return {
     open_documents: Object.values(state.documents).map(documentSession),
+    closed_documents: Object.entries(state.closedDrafts).map(([path, draft]) => ({
+      path,
+      cursor_start: draft.cursor_start ?? 0,
+      cursor_end: draft.cursor_end ?? 0,
+      draft_content: draft.draft_content ?? null,
+    })),
     active_document: state.activeDocument,
     panels: currentPanelSnapshot(),
   };
 }
 
+function emergencySessionKey(root = state.project.root) {
+  return root ? `rho.project-session:${root}` : null;
+}
+
+function persistEmergencySession() {
+  const key = emergencySessionKey();
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({
+      saved_at: Date.now(),
+      snapshot: buildSessionSnapshot(),
+    }));
+  } catch {
+    // The broker-backed session remains authoritative when browser storage is unavailable.
+  }
+}
+
+function loadEmergencySession(root) {
+  const key = emergencySessionKey(root);
+  if (!key) return null;
+  try {
+    return JSON.parse(localStorage.getItem(key) || "null")?.snapshot || null;
+  } catch {
+    return null;
+  }
+}
+
 function scheduleSessionSave() {
   if (state.projectStatus !== "ready" || !state.project.root) return;
+  persistEmergencySession();
   clearTimeout(state.sessionSaveTimer);
   state.sessionSaveTimer = setTimeout(async () => {
     await flushSessionSnapshot();
@@ -1282,8 +1316,11 @@ async function flushSessionSnapshot() {
   if (state.projectStatus !== "ready" || !state.project.root) return;
   clearTimeout(state.sessionSaveTimer);
   state.sessionSaveTimer = null;
+  persistEmergencySession();
   try {
     await invoke("project_save_session", { snapshot: buildSessionSnapshot() });
+    const key = emergencySessionKey();
+    if (key) localStorage.removeItem(key);
   } catch (error) {
     toast(`Session state was not saved: ${error}`, true);
   }
@@ -2291,13 +2328,13 @@ async function renderActiveDocumentFile() {
     const response = await invoke("render_document", {
       request: {
         path,
-        document_version: documentState?.version ?? null,
+        document_version: documentState?.versionId ?? null,
       },
     });
     renderExecution(response, {
       type: "render",
       sourcePath: path,
-      documentVersion: documentState?.version ?? null,
+      documentVersion: documentState?.versionId ?? null,
     }, "USER");
     await Promise.all([loadRunData(), refreshEnvironment()]);
   } catch (error) {
@@ -2572,10 +2609,19 @@ async function hydrateProject(response) {
   state.editor.models.forEach((model) => model.dispose());
   state.editor.models.clear();
   state.project = response.project || { root: "", files: [] };
-  applySessionPanels(response.session?.panels || {});
+  const session = loadEmergencySession(state.project.root) || response.session || {};
+  for (const entry of session.closed_documents || []) {
+    if (!entry?.path || entry.draft_content === null || entry.draft_content === undefined) continue;
+    state.closedDrafts[entry.path] = {
+      draft_content: entry.draft_content,
+      cursor_start: entry.cursor_start ?? 0,
+      cursor_end: entry.cursor_end ?? 0,
+    };
+  }
+  applySessionPanels(session.panels || {});
   setProjectStatus("ready");
-  const sessionDocuments = response.session?.open_documents || [];
-  const activeDocumentPath = response.session?.active_document;
+  const sessionDocuments = session.open_documents || [];
+  const activeDocumentPath = session.active_document;
   for (const entry of sessionDocuments) {
     await openDocument(entry.path, { sessionEntry: entry });
   }
@@ -2678,6 +2724,8 @@ $("#editor").addEventListener("keyup", () => {
 $("#editor").addEventListener("scroll", () => { $("#lineNumbers").scrollTop = $("#editor").scrollTop; });
 window.addEventListener("beforeunload", () => {
   if (state.agentPollTimer) window.clearInterval(state.agentPollTimer);
+  syncDocumentFromEditor({ render: false, persist: false });
+  persistEmergencySession();
   flushSessionSnapshot().catch(() => {});
 });
 $("#editor").addEventListener("keydown", (event) => {

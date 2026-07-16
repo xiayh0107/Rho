@@ -7,7 +7,7 @@ Date: 2026-07-16
 The current internal prototype installer is generated at:
 
 ```text
-D:\Rho\target\release\bundle\nsis\Rho_0.2.0-dev.1_x64-setup.exe
+D:\Rho\target\release\bundle\nsis\Rho_0.2.0-dev.2_x64-setup.exe
 ```
 
 It is an unsigned 64-bit NSIS installer. Windows SmartScreen may therefore
@@ -65,6 +65,18 @@ in a nonstandard location.
     execution ID, source path, retry linkage and recovery semantics.
 16. Incomplete runs are marked on restart, active runs can be cancelled through
     bounded interrupt, and the Runs panel now reflects durable run history.
+17. Ask and Plan mutations are rejected by broker policy. Act approvals are
+    single-use and bound to the exact code and workspace revision shown in UI.
+18. Agent turns and approval outcomes persist independently from Workspace R;
+    restart interrupts orphaned turns and approvals explicitly.
+19. Environment reports R, library paths, `renv`, Bioconductor, attached
+    packages and optional render capabilities from bounded Workspace probes.
+20. Data-frame, matrix, vector and list previews cap rows, columns, items and
+    individual value size before JSON serialization.
+21. Plot history links images to run, source path, document version and
+    workspace revision, marking incomplete provenance explicitly.
+22. `.Rmd` and `.qmd` rendering is restricted to the active project root and
+    reports missing tooling or render failures through structured runs.
 
 The installed build was verified to launch Ark from:
 
@@ -96,10 +108,9 @@ loading are also covered.
 ## Deliberately deferred
 
 - bounded local completion and richer R language features;
-- persistent ChatSession history across Agent R restarts;
-- interactive approval dialogs instead of mode-level Act approval;
-- paged data viewers, plot history and HTML viewers;
-- richer cancellation/crash recovery UX beyond the current durable run model;
+- persistent multi-turn ChatSession context beyond durable turn history;
+- paged full-table viewers and standalone HTML artifact viewers;
+- richer job management beyond the current bounded cancellation/restart model;
 - automatic R/aisdk installation and credential settings UI;
 - installer signing, auto-update and external distribution hardening;
 - macOS and Linux packaging.

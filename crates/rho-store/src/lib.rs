@@ -436,9 +436,19 @@ impl Store {
         ensure_column(&self.connection, "runs", "document_version", "INTEGER")?;
         ensure_column(&self.connection, "runs", "workspace_id", "TEXT")?;
         ensure_column(&self.connection, "runs", "state_revision_before", "INTEGER")?;
-        ensure_column(&self.connection, "runs", "project_revision_before", "INTEGER")?;
+        ensure_column(
+            &self.connection,
+            "runs",
+            "project_revision_before",
+            "INTEGER",
+        )?;
         ensure_column(&self.connection, "runs", "state_revision_after", "INTEGER")?;
-        ensure_column(&self.connection, "runs", "project_revision_after", "INTEGER")?;
+        ensure_column(
+            &self.connection,
+            "runs",
+            "project_revision_after",
+            "INTEGER",
+        )?;
         ensure_column(&self.connection, "runs", "stdout", "TEXT")?;
         ensure_column(&self.connection, "runs", "value_text", "TEXT")?;
         ensure_column(
@@ -674,7 +684,8 @@ impl Store {
                 error_message: row.get(18)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn list_problems(&self, limit: Option<usize>) -> Result<Vec<ProblemSummary>, StoreError> {
@@ -706,7 +717,8 @@ impl Store {
                 finished_at: row.get(12)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn get_run_detail(&self, run_id: &str) -> Result<Option<RunDetail>, StoreError> {
@@ -927,7 +939,8 @@ impl Store {
                 pending_request_id: row.get(15)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn list_approval_requests(
@@ -949,7 +962,8 @@ impl Store {
             params![limit.unwrap_or(DEFAULT_LIMIT) as i64, status],
             decode_approval_request,
         )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn get_agent_turn_detail(
@@ -1022,6 +1036,20 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn recover_incomplete_approvals(&mut self) -> Result<usize, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE approval_requests
+             SET status = 'interrupted',
+                 decision = COALESCE(decision, 'cancel'),
+                 reason = COALESCE(reason, 'Approval interrupted by desktop restart'),
+                 continuation_outcome = COALESCE(continuation_outcome, 'desktop_restart'),
+                 responded_at = COALESCE(responded_at, ?1)
+             WHERE status = 'waiting'",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed)
+    }
+
     pub fn create_plot_artifact(&mut self, draft: &PlotArtifactDraft) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO plot_artifacts(
@@ -1078,7 +1106,27 @@ impl Store {
                 created_at: row.get(11)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ApprovalRequestSummary>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    request_id, turn_id, tool, policy, status, decision, reason,
+                    arguments_json, code, workspace_id, state_revision, project_revision,
+                    requested_at, responded_at, continuation_outcome
+                 FROM approval_requests
+                 WHERE request_id = ?1",
+                [request_id],
+                decode_approval_request,
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 }
 
@@ -1198,15 +1246,14 @@ fn decode_string_list(input: &str) -> Result<Vec<String>, serde_json::Error> {
 }
 
 fn sqlite_function_error(error: serde_json::Error) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(error),
-    )
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn code_preview(code: &str) -> String {
-    let first_line = code.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+    let first_line = code
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
     let trimmed = first_line.trim();
     let mut preview = trimmed.chars().take(80).collect::<String>();
     if trimmed.chars().count() > 80 {
@@ -1432,9 +1479,24 @@ mod tests {
             })
             .unwrap();
         store.update_agent_turn_status("turn_1", "waiting").unwrap();
+        store
+            .create_approval_request(&ApprovalRequestDraft {
+                request_id: "req_1".to_string(),
+                turn_id: "turn_1".to_string(),
+                tool: "run_r".to_string(),
+                policy: "required".to_string(),
+                arguments_json: "{\"code\":\"x <- 1\"}".to_string(),
+                code: Some("x <- 1".to_string()),
+                workspace_id: "ws_test".to_string(),
+                state_revision: 1,
+                project_revision: 0,
+            })
+            .unwrap();
         assert_eq!(store.recover_incomplete_agent_turns().unwrap(), 1);
+        assert_eq!(store.recover_incomplete_approvals().unwrap(), 1);
         let detail = store.get_agent_turn_detail("turn_1").unwrap().unwrap();
         assert_eq!(detail.turn.status, "interrupted");
         assert!(detail.turn.error_message.is_some());
+        assert_eq!(detail.approvals[0].status, "interrupted");
     }
 }

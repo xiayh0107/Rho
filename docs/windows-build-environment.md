@@ -1,7 +1,7 @@
 # Rho Windows Build Environment
 
 Date: 2026-07-16  
-Validated release: `0.2.0-dev.1`  
+Validated release: `0.2.0-dev.2`
 Repository root: `D:\Rho`
 
 ## Purpose
@@ -49,7 +49,7 @@ that produced the validated installer.
 | Rtools compiler | Rtools45 GCC `14.3.0` |
 | Ark | `0.1.252`, Windows x64 |
 | Tauri Rust crate | `2.11.5` |
-| Tauri CLI | build script requests `@tauri-apps/cli@2`; npm cache currently contains `2.11.4` |
+| Tauri CLI | pinned `2.11.4` |
 | WebView2Loader.dll | `1.0.3650.58`, x64 |
 | aisdk | `1.5.0` |
 | aisdk.console | `0.1.0` |
@@ -103,7 +103,7 @@ A clean first build may require network access for:
 
 - the checksum-pinned Ark archive from the Posit Ark GitHub release;
 - Rust crates referenced by `Cargo.lock`;
-- `@tauri-apps/cli@2` invoked through `npx`;
+- checksum-resolved `@tauri-apps/cli@2.11.4` invoked through `npx`;
 - Tauri's NSIS bundling tools if they are not already cached.
 
 Ark is pinned exactly in `runtime/ark.json`:
@@ -113,10 +113,9 @@ version: 0.1.252
 sha256: A6C2C6AE931D0DD5E1F771243BF3DF4F86968462BBD8E08CEEBA7F2E53567E58
 ```
 
-The Tauri CLI major version is currently constrained but not locked to an
-exact patch version. For a build report, record the resolved CLI version. Do
-not silently update the script or `Cargo.lock` as part of unrelated feature
-work.
+The Tauri CLI is pinned to `2.11.4`. For a build report, record the resolved
+CLI version and do not silently update the script or `Cargo.lock` as part of
+unrelated feature work.
 
 ## R And Ark Bootstrap
 
@@ -192,7 +191,7 @@ The script performs these steps:
 1. selects the GNU Rust toolchain and Rtools45 linker;
 2. requires the bootstrapped Ark runtime;
 3. copies `ark.exe`, `LICENSE` and `NOTICE` into the Tauri resource tree;
-4. runs `npx.cmd -y "@tauri-apps/cli@2" build` from
+4. runs `npx.cmd -y "@tauri-apps/cli@2.11.4" build` from
    `desktop\src-tauri`;
 5. creates the per-user x64 NSIS installer.
 
@@ -200,14 +199,15 @@ Expected outputs:
 
 ```text
 D:\Rho\target\release\rho-desktop.exe
-D:\Rho\target\release\bundle\nsis\Rho_0.2.0-dev.1_x64-setup.exe
+D:\Rho\target\release\bundle\nsis\Rho_0.2.0-dev.2_x64-setup.exe
 ```
 
-Validated `0.2.0-dev.1` artifact snapshot:
+Validated `0.2.0-dev.2` artifact snapshot:
 
 ```text
-Installer size: 12,038,232 bytes
-SHA-256: 1FC4E8668A6AB6F596FF9311CCE2116C85576EEE53A512DA03F899BC7B3D39AD
+Installer size: 15,572,612 bytes
+Installer SHA-256: 2923E54F286492D44C9B494D1268A8004E489FE15B8A3D5181F7A6B66B5D8C05
+rho-desktop.exe size: 38,139,476 bytes
 ```
 
 The hash identifies the already validated artifact only. A legitimate rebuild

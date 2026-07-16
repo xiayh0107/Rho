@@ -51,6 +51,27 @@ test_that("vector previews stay bounded", {
   expect_true(result$preview$truncated)
 })
 
+test_that("tabular previews bound nested and long cell payloads by bytes", {
+  workspace <- new.env(parent = baseenv())
+  workspace$x <- data.frame(id = 1L)
+  workspace$x$payload <- I(list(strrep("x", 1000000L)))
+  result <- rho_inspect_object("x", envir = workspace)
+  encoded <- jsonlite::toJSON(result, auto_unbox = TRUE, null = "null")
+
+  expect_lt(nchar(encoded, type = "bytes"), 50000L)
+  expect_match(result$preview$rows[[1L]]$payload, "truncated|length")
+})
+
+test_that("list previews bound long item names", {
+  workspace <- new.env(parent = baseenv())
+  workspace$x <- setNames(list(1L), strrep("x", 1000000L))
+  result <- rho_inspect_object("x", envir = workspace)
+  encoded <- jsonlite::toJSON(result, auto_unbox = TRUE, null = "null")
+
+  expect_lt(nchar(encoded, type = "bytes"), 50000L)
+  expect_match(result$preview$items[[1L]], "truncated")
+})
+
 test_that("render probe degrades cleanly when tooling is unavailable", {
   file <- tempfile(fileext = ".qmd")
   writeLines("---\ntitle: Test\n---\n\nHello", file)

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,6 +18,17 @@ use rho_store::{
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, oneshot};
+
+pub struct CoordinatorRuntime {
+    pub broker: BrokerState,
+    pub store: Store,
+}
+
+#[derive(Debug, Clone)]
+struct ApprovedMutation {
+    request_type: String,
+    arguments: Value,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalResponseInput {
@@ -43,6 +55,22 @@ impl PendingApprovalRegistry {
 
     pub async fn remove(&self, request_id: &str) {
         self.waiters.lock().await.remove(request_id);
+    }
+
+    pub async fn cancel_all(&self, reason: impl Into<String>) -> usize {
+        let reason = reason.into();
+        let waiters = {
+            let mut waiters = self.waiters.lock().await;
+            std::mem::take(&mut *waiters)
+        };
+        let count = waiters.len();
+        for (_, sender) in waiters {
+            let _ = sender.send(ApprovalResponseInput {
+                decision: "cancel".to_string(),
+                reason: Some(reason.clone()),
+            });
+        }
+        count
     }
 }
 
@@ -370,6 +398,23 @@ async fn send_identity(
     Ok(())
 }
 
+async fn send_shared_identity(
+    agent: &mut AuthenticatedAgent,
+    context: Arc<Mutex<CoordinatorRuntime>>,
+) -> Result<()> {
+    let event = {
+        let mut context = context.lock().await;
+        let event = Envelope::new(
+            MessageKind::Event,
+            json!({"type": "workspace.identity", "identity": context.broker.identity()}),
+        );
+        context.store.append_event(&event)?;
+        event
+    };
+    write_async_frame(&mut agent.stream, &event).await?;
+    Ok(())
+}
+
 async fn run_user_probe(
     session: &ArkSession,
     broker: &mut BrokerState,
@@ -575,7 +620,9 @@ pub async fn dispatch_workspace_request(
     match execution {
         Ok(()) => {}
         Err(error) => {
-            let cancelled = store.cancel_requested(&request.execution_id).unwrap_or(false);
+            let cancelled = store
+                .cancel_requested(&request.execution_id)
+                .unwrap_or(false);
             store.finish_run(&RunFinish {
                 run_id: request.execution_id.clone(),
                 status: if cancelled { "interrupted" } else { "failed" }.to_string(),
@@ -604,7 +651,9 @@ pub async fn dispatch_workspace_request(
     let result = match result_file.read_json() {
         Ok(value) => value,
         Err(error) => {
-            let cancelled = store.cancel_requested(&request.execution_id).unwrap_or(false);
+            let cancelled = store
+                .cancel_requested(&request.execution_id)
+                .unwrap_or(false);
             store.finish_run(&RunFinish {
                 run_id: request.execution_id.clone(),
                 status: if cancelled { "interrupted" } else { "failed" }.to_string(),
@@ -683,7 +732,11 @@ pub async fn dispatch_workspace_request(
             provenance_complete: arguments
                 .get("source_path")
                 .and_then(Value::as_str)
-                .is_some(),
+                .is_some_and(|path| !path.starts_with('<'))
+                && arguments
+                    .get("document_version")
+                    .and_then(Value::as_i64)
+                    .is_some(),
         })?;
     }
     Ok(json!({
@@ -697,8 +750,7 @@ pub async fn dispatch_workspace_request(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     session: &ArkSession,
-    broker: &mut BrokerState,
-    store: &mut Store,
+    context: Arc<Mutex<CoordinatorRuntime>>,
     rscript: PathBuf,
     agent_package: PathBuf,
     model: String,
@@ -788,12 +840,11 @@ close(connection)
         )
         .await
         .context("timed out waiting for desktop Agent R authentication")??;
-        send_identity(&mut agent, broker, store).await?;
+        send_shared_identity(&mut agent, context.clone()).await?;
         let completion_result = serve_desktop_agent(
             &mut agent,
             session,
-            broker,
-            store,
+            context.clone(),
             &turn_id,
             &mode,
             approvals.clone(),
@@ -818,8 +869,9 @@ close(connection)
             output.status,
             redact_sensitive_text(&String::from_utf8_lossy(&output.stderr))
         );
-        let after = broker.identity().clone();
-        store.finish_agent_turn(&AgentTurnFinish {
+        let mut context = context.lock().await;
+        let after = context.broker.identity().clone();
+        context.store.finish_agent_turn(&AgentTurnFinish {
             turn_id: turn_id.clone(),
             status: "completed".to_string(),
             workspace_id_after: Some(after.workspace_id),
@@ -832,7 +884,7 @@ close(connection)
             "turn_id": turn_id,
             "model": model,
             "mode": mode,
-            "workspace": broker.identity(),
+            "workspace": context.broker.identity(),
             "events": completion.events,
             "stdout": redact_sensitive_text(&String::from_utf8_lossy(&output.stdout)),
             "stderr": redact_sensitive_text(&String::from_utf8_lossy(&output.stderr))
@@ -841,8 +893,9 @@ close(connection)
     .await;
 
     if let Err(error) = &result {
-        let after = broker.identity().clone();
-        store.finish_agent_turn(&AgentTurnFinish {
+        let mut context = context.lock().await;
+        let after = context.broker.identity().clone();
+        context.store.finish_agent_turn(&AgentTurnFinish {
             turn_id,
             status: "failed".to_string(),
             workspace_id_after: Some(after.workspace_id),
@@ -858,14 +911,14 @@ close(connection)
 async fn serve_desktop_agent(
     agent: &mut AuthenticatedAgent,
     session: &ArkSession,
-    broker: &mut BrokerState,
-    store: &mut Store,
+    context: Arc<Mutex<CoordinatorRuntime>>,
     turn_id: &str,
     mode: &str,
     approvals: Arc<PendingApprovalRegistry>,
 ) -> Result<DesktopAgentCompletion> {
     let mut events = Vec::new();
     let mut final_message = None;
+    let mut approved_mutations = HashMap::new();
     loop {
         let incoming = tokio::time::timeout(
             std::time::Duration::from_secs(120),
@@ -873,7 +926,7 @@ async fn serve_desktop_agent(
         )
         .await
         .context("timed out waiting for desktop Agent R request")??;
-        store.append_event(&incoming)?;
+        context.lock().await.store.append_event(&incoming)?;
 
         match incoming.kind {
             MessageKind::Request => {
@@ -883,21 +936,34 @@ async fn serve_desktop_agent(
                         &incoming,
                         turn_id,
                         mode,
-                        broker,
-                        store,
+                        context.clone(),
                         approvals.clone(),
+                        &mut approved_mutations,
                     )
                     .await
                 } else {
-                    dispatch_workspace_request(
+                    let authorization = authorize_agent_workspace_request(
+                        mode,
                         request_type,
                         &incoming.payload,
-                        ExecutionOrigin::Agent,
-                        session,
-                        broker,
-                        store,
-                    )
-                    .await
+                        &mut approved_mutations,
+                    );
+                    match authorization {
+                        Ok(()) => {
+                            let mut context = context.lock().await;
+                            let CoordinatorRuntime { broker, store } = &mut *context;
+                            dispatch_workspace_request(
+                                request_type,
+                                &incoming.payload,
+                                ExecutionOrigin::Agent,
+                                session,
+                                broker,
+                                store,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 };
                 let response = match result {
                     Ok(value) => Envelope::new(
@@ -920,10 +986,10 @@ async fn serve_desktop_agent(
                     ),
                 };
                 let ok = response.payload["ok"].as_bool().unwrap_or(false);
-                store.append_event(&response)?;
+                context.lock().await.store.append_event(&response)?;
                 write_async_frame(&mut agent.stream, &response).await?;
                 if !ok {
-                    send_identity(agent, broker, store).await?;
+                    send_shared_identity(agent, context.clone()).await?;
                 }
             }
             MessageKind::Event => {
@@ -931,7 +997,11 @@ async fn serve_desktop_agent(
                 if let Some(text) = event_message_text(&incoming.payload) {
                     final_message = Some(text);
                 }
-                record_agent_turn_event(store, turn_id, &incoming.payload)?;
+                record_agent_turn_event(
+                    &mut context.lock().await.store,
+                    turn_id,
+                    &incoming.payload,
+                )?;
                 events.push(incoming.payload);
                 if completed {
                     return Ok(DesktopAgentCompletion {
@@ -950,13 +1020,48 @@ async fn serve_desktop_agent(
     }
 }
 
+fn authorize_agent_workspace_request(
+    mode: &str,
+    request_type: &str,
+    payload: &Value,
+    approved_mutations: &mut HashMap<String, ApprovedMutation>,
+) -> Result<()> {
+    match request_type {
+        "workspace.snapshot" | "workspace.inspect_object" => Ok(()),
+        "workspace.execute" => {
+            ensure!(mode == "act", "{mode} mode cannot mutate Workspace R");
+            let request_id = payload
+                .get("approval_request_id")
+                .and_then(Value::as_str)
+                .context("Agent mutation omitted approval_request_id")?;
+            let approved = approved_mutations
+                .remove(request_id)
+                .context("Agent mutation has no live broker approval")?;
+            ensure!(
+                approved.request_type == request_type,
+                "Approved request type does not match Agent mutation"
+            );
+            let arguments = payload
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            ensure!(
+                approved.arguments == arguments,
+                "Agent mutation arguments differ from the approved request"
+            );
+            Ok(())
+        }
+        _ => bail!("Agent request type `{request_type}` is not allowed by desktop policy"),
+    }
+}
+
 async fn handle_tool_approval_required(
     incoming: &Envelope,
     turn_id: &str,
     mode: &str,
-    broker: &BrokerState,
-    store: &mut Store,
+    context: Arc<Mutex<CoordinatorRuntime>>,
     approvals: Arc<PendingApprovalRegistry>,
+    approved_mutations: &mut HashMap<String, ApprovedMutation>,
 ) -> Result<Value> {
     let tool = incoming.payload["tool"]
         .as_str()
@@ -972,6 +1077,17 @@ async fn handle_tool_approval_required(
         .unwrap_or("required")
         .to_string();
     let request_id = incoming.id.clone();
+    let request_type = match tool.as_str() {
+        "run_r" => Some("workspace.execute"),
+        _ => None,
+    };
+    let receiver = if mode == "act" && request_type.is_some() {
+        Some(approvals.register(request_id.clone()).await)
+    } else {
+        None
+    };
+    let mut context_guard = context.lock().await;
+    let CoordinatorRuntime { broker, store } = &mut *context_guard;
     let identity = broker.identity().clone();
     let code = arguments
         .get("code")
@@ -990,8 +1106,12 @@ async fn handle_tool_approval_required(
         project_revision: identity.project_revision as i64,
     })?;
 
-    if mode != "act" {
-        let reason = format!("{mode} mode is read-only and cannot execute `{tool}`");
+    if mode != "act" || request_type.is_none() {
+        let reason = if mode != "act" {
+            format!("{mode} mode is read-only and cannot execute `{tool}`")
+        } else {
+            format!("Tool `{tool}` is not approved for Workspace mutation")
+        };
         store.resolve_approval_request(
             &request_id,
             &ApprovalDecisionRecord {
@@ -1021,6 +1141,7 @@ async fn handle_tool_approval_required(
         }));
     }
 
+    let receiver = receiver.context("Approval waiter was not registered")?;
     store.update_agent_turn_status(turn_id, "waiting")?;
     store.append_agent_turn_event(&AgentTurnEventDraft {
         turn_id: turn_id.to_string(),
@@ -1034,13 +1155,15 @@ async fn handle_tool_approval_required(
         details_json: serde_json::to_string(&incoming.payload)?,
     })?;
 
-    let receiver = approvals.register(request_id.clone()).await;
+    drop(context_guard);
     let response = receiver.await.unwrap_or(ApprovalResponseInput {
         decision: "cancel".to_string(),
         reason: Some("Approval channel closed before a decision was delivered.".to_string()),
     });
     approvals.remove(&request_id).await;
 
+    let mut context_guard = context.lock().await;
+    let CoordinatorRuntime { broker, store } = &mut *context_guard;
     let current = broker.identity();
     if response.decision == "approve"
         && (current.workspace_id != identity.workspace_id
@@ -1136,9 +1259,19 @@ async fn handle_tool_approval_required(
             "continuation_outcome": continuation
         }))?,
     })?;
+    if approved {
+        approved_mutations.insert(
+            request_id.clone(),
+            ApprovedMutation {
+                request_type: request_type.unwrap().to_string(),
+                arguments,
+            },
+        );
+    }
     Ok(json!({
         "approved": approved,
         "request_id": request_id,
+        "approval_request_id": request_id,
         "decision": status,
         "reason": body,
         "policy": "desktop_act_mode"
@@ -1165,7 +1298,11 @@ fn project_agent_turn_event(turn_id: &str, payload: &Value) -> Result<Option<Age
                 .map(|tools| {
                     format!(
                         "Tools available: {}",
-                        tools.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                        tools
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 }),
             "running".to_string(),
@@ -1195,9 +1332,10 @@ fn project_agent_turn_event(turn_id: &str, payload: &Value) -> Result<Option<Age
                 "Tool completed · {}",
                 payload["tool"].as_str().unwrap_or("workspace_tool")
             ),
-            payload["result_preview"].as_str().map(str::to_string).or_else(|| {
-                Some("Workspace result returned.".to_string())
-            }),
+            payload["result_preview"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| Some("Workspace result returned.".to_string())),
             "completed".to_string(),
             payload["tool"].as_str().map(str::to_string),
             None,
@@ -1327,6 +1465,18 @@ fn bridge_expression(request_type: &str, arguments: &Value) -> Result<(Operation
                 ),
             ))
         }
+        "workspace.set_project_root" => {
+            let code = arguments["code"]
+                .as_str()
+                .context("workspace.set_project_root requires string argument `code`")?;
+            Ok((
+                OperationClass::StateAndProjectMutation,
+                format!(
+                    "{bridge}$rho_execute({}, envir = .GlobalEnv)",
+                    r_string(code)?
+                ),
+            ))
+        }
         _ => bail!("unsupported Agent R request type: {request_type}"),
     }
 }
@@ -1354,7 +1504,7 @@ fn operation_class_name(class: OperationClass) -> &'static str {
 
 fn requested_code(request_type: &str, arguments: &Value, bridge_expression: &str) -> String {
     match request_type {
-        "workspace.execute" => arguments
+        "workspace.execute" | "workspace.set_project_root" => arguments
             .get("code")
             .and_then(Value::as_str)
             .unwrap_or(bridge_expression)
@@ -1541,5 +1691,68 @@ mod tests {
         assert!(!redacted.contains("json-secret"));
         assert!(!redacted.contains("spaced-secret"));
         assert!(redacted.contains("&KEY=[REDACTED]&mode=1"));
+    }
+
+    #[test]
+    fn agent_mutation_requires_matching_single_use_approval() {
+        let arguments = json!({"code": "x <- 1"});
+        let payload = json!({
+            "arguments": arguments,
+            "approval_request_id": "req_1"
+        });
+        let mut approvals = HashMap::from([(
+            "req_1".to_string(),
+            ApprovedMutation {
+                request_type: "workspace.execute".to_string(),
+                arguments: json!({"code": "x <- 1"}),
+            },
+        )]);
+
+        assert!(authorize_agent_workspace_request(
+            "ask",
+            "workspace.execute",
+            &payload,
+            &mut approvals,
+        )
+        .is_err());
+        assert!(authorize_agent_workspace_request(
+            "act",
+            "workspace.execute",
+            &payload,
+            &mut approvals,
+        )
+        .is_ok());
+        assert!(approvals.is_empty());
+        assert!(authorize_agent_workspace_request(
+            "act",
+            "workspace.execute",
+            &payload,
+            &mut approvals,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn agent_mutation_rejects_arguments_changed_after_approval() {
+        let mut approvals = HashMap::from([(
+            "req_1".to_string(),
+            ApprovedMutation {
+                request_type: "workspace.execute".to_string(),
+                arguments: json!({"code": "x <- 1"}),
+            },
+        )]);
+        let payload = json!({
+            "arguments": {"code": "x <- 2"},
+            "approval_request_id": "req_1"
+        });
+
+        assert!(authorize_agent_workspace_request(
+            "act",
+            "workspace.execute",
+            &payload,
+            &mut approvals,
+        )
+        .is_err());
+        assert!(approvals.is_empty());
     }
 }

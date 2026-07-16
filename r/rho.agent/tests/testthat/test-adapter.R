@@ -58,6 +58,23 @@ test_that("broker tool results refresh the workspace identity", {
   expect_identical(requests[[2L]]$expected_workspace$state_revision, 2L)
 })
 
+test_that("approved mutation request id is consumed by the next run_r call", {
+  captured <- NULL
+  local_mocked_bindings(
+    rho_agent_request = function(type, payload, ...) {
+      captured <<- payload
+      list(ok = TRUE)
+    },
+    .package = "rho.agent"
+  )
+  .rho_agent_state$pending_approval <- list(request_id = "req_approved")
+
+  rho.agent:::rho_broker_tool_request("workspace.execute", list(code = "x <- 1"))
+
+  expect_identical(captured$approval_request_id, "req_approved")
+  expect_null(.rho_agent_state$pending_approval)
+})
+
 test_that("aisdk session is marked as a Rho desktop session", {
   skip_if_not_installed("aisdk")
   session <- rho_create_aisdk_session(model = NULL)

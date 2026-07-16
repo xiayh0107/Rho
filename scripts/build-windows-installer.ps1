@@ -22,7 +22,7 @@ foreach ($name in @("ark.exe", "LICENSE", "NOTICE")) {
 
 Push-Location (Join-Path $repo "desktop\src-tauri")
 try {
-    & npx.cmd -y "@tauri-apps/cli@2" build
+    & npx.cmd -y "@tauri-apps/cli@2.11.4" build
     if ($LASTEXITCODE -ne 0) {
         throw "Tauri build failed with exit code $LASTEXITCODE."
     }
@@ -31,5 +31,5 @@ finally {
     Pop-Location
 }
 
-$installer = Join-Path $repo "target\release\bundle\nsis\Rho_0.2.0-dev.1_x64-setup.exe"
+$installer = Join-Path $repo "target\release\bundle\nsis\Rho_0.2.0-dev.2_x64-setup.exe"
 Write-Host "Rho installer: $installer"

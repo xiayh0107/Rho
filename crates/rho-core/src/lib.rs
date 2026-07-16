@@ -59,6 +59,10 @@ impl BrokerState {
         self.identity.apply(request.operation_class);
     }
 
+    pub fn project_changed(&mut self) {
+        self.identity.apply(OperationClass::ProjectMutation);
+    }
+
     pub fn kernel_restarted(&mut self) {
         self.identity.restart_kernel();
     }

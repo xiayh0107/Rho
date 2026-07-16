@@ -3,6 +3,7 @@
 .rho_agent_state$protocol_version <- 1L
 .rho_agent_state$max_frame_bytes <- 8L * 1024L * 1024L
 .rho_agent_state$workspace_identity <- NULL
+.rho_agent_state$pending_approval <- NULL
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
