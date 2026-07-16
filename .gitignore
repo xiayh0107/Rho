@@ -7,3 +7,7 @@
 .RData
 .DS_Store
 *.log
+/desktop/resources/runtime/ark.exe
+/desktop/resources/runtime/LICENSE
+/desktop/resources/runtime/NOTICE
+/desktop/src-tauri/gen/

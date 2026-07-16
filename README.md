@@ -49,3 +49,25 @@ the GCC linker already provided by Rtools.
 The full reviewed implementation plan is in `Rho-implementation-plan.md`.
 Current evidence and remaining Phase 0 gates are tracked in
 `docs/phase-0-status.md`.
+
+## Windows prototype
+
+The first installable Tauri prototype is available at:
+
+```text
+target\release\bundle\nsis\Rho_0.1.0_x64-setup.exe
+```
+
+It provides a live R editor and Console, Environment, real plot output,
+Problems, and an Ask/Plan/Act Agent panel backed by DeepSeek and the same Ark
+Workspace R. Ark and its Windows WebView loader are included in the installer;
+the machine must already provide R, and aisdk is required only for Agent turns.
+
+Build it with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1
+```
+
+Installation prerequisites, verified behavior and intentionally deferred
+features are documented in `docs/windows-prototype.md`.

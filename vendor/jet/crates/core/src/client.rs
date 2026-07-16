@@ -690,9 +690,9 @@ impl Client {
     /// their process group (handled inside `Kernel` — needs the pid); `Message`-mode
     /// kernels get an `interrupt_request` pushed onto the control-send channel so it
     /// races through the socket loop without waiting behind shell traffic.
-    pub async fn interrupt(&mut self) -> Result<()> {
+    pub async fn interrupt(&self) -> Result<()> {
         match self.interrupt_mode {
-            crate::kernel_spec::InterruptMode::Signal => self.kernel.interrupt().await,
+            crate::kernel_spec::InterruptMode::Signal => self.kernel.interrupt_signal(),
             crate::kernel_spec::InterruptMode::Message => {
                 let msg: JupyterMessage = jupyter_protocol::InterruptRequest::default().into();
                 self.control_tx

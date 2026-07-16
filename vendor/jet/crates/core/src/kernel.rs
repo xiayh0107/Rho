@@ -517,7 +517,7 @@ impl Kernel {
         }
     }
 
-    fn interrupt_signal(&self) -> Result<()> {
+    pub(crate) fn interrupt_signal(&self) -> Result<()> {
         let Some(_pid) = self.child_pid().or(self.attached_pid) else {
             // Attached without a known pid, or already gone — nothing to signal.
             return Ok(());

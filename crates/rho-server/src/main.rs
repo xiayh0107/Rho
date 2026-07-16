@@ -10,8 +10,6 @@ use rho_kernel::{ArkLaunchConfig, ArkSession, KernelEvent};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
-mod coordinator;
-
 #[derive(Debug, Parser)]
 #[command(name = "rho-server", about = "Rho Phase 0 runtime probes")]
 struct Cli {
@@ -119,7 +117,7 @@ async fn main() -> Result<()> {
             model,
             prompt,
         } => {
-            coordinator::probe(
+            rho_server::coordinator::probe(
                 kernelspec,
                 rscript,
                 agent_package,

@@ -8,6 +8,18 @@ Jet revision: `52ae131dd168fe2e104d306cc4bf5bbeae749200`
 
 ## Implemented and verified
 
+- A Tauri 2 Windows prototype is now packaged as an 11.45 MB x64 NSIS
+  installer. It installs per-user, creates a Start Menu shortcut, and launches
+  the bundled Ark binary from the installation directory rather than the
+  development tree.
+- The prototype exposes a live source editor and Console, Environment object
+  manifest, PNG plot output, structured Problems, revision status, interrupt
+  and restart controls, plus an Ask/Plan/Act Agent timeline.
+- Desktop backend smoke tests create a data frame in Workspace R, receive a
+  real plot and Environment object, then complete a read-only DeepSeek turn
+  against the same Ark session. Browser UI checks cover 1280 by 720 and the
+  minimum 1024 by 680 viewport without incoherent overlap.
+
 - Rust starts Ark directly and connects over signed Jupyter/ZeroMQ channels.
 - No Python, Jupyter Server, JupyterLab, notebook process, or `uv` is used.
 - Shell, iopub, stdin, control, and shutdown paths work on Windows.
@@ -121,7 +133,7 @@ Jet revision: `52ae131dd168fe2e104d306cc4bf5bbeae749200`
 - Add cancellation, timeout, crash, oversized-frame, and child credential
   redaction integration tests.
 - Compare arf headless against the measured Ark path and close ADR-009.
-- Stream events into the minimal browser UI through generated Workbench
-  Protocol types.
+- Replace the prototype's direct Tauri command payloads with generated
+  Workbench Protocol types and incremental event streaming.
 - Run equivalent runtime probes on macOS and Linux and add signed packaging
   inputs for each target.

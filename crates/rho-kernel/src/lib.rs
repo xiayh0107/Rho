@@ -129,7 +129,7 @@ impl ArkSession {
         self.client.child_pid()
     }
 
-    pub async fn is_complete(&mut self, code: impl Into<String>) -> Result<CodeCompleteness> {
+    pub async fn is_complete(&self, code: impl Into<String>) -> Result<CodeCompleteness> {
         let request: JupyterMessage = IsCompleteRequest { code: code.into() }.into();
         let request_id = request.header.msg_id.clone();
         let mut listener = self.client.listen(ListenFilter::default());
@@ -164,7 +164,7 @@ impl ArkSession {
     }
 
     pub async fn open_comm(
-        &mut self,
+        &self,
         target_name: impl Into<String>,
         data: Value,
         message_count: usize,
@@ -218,7 +218,7 @@ impl ArkSession {
             .with_context(|| format!("timed out waiting for Ark comm `{comm_id}`"))?
     }
 
-    pub async fn comm_info(&mut self, target_name: Option<String>) -> Result<CommInfoReply> {
+    pub async fn comm_info(&self, target_name: Option<String>) -> Result<CommInfoReply> {
         let mut stream = self.client.comm_info(target_name)?;
         let wait = async {
             loop {
@@ -237,7 +237,7 @@ impl ArkSession {
     }
 
     pub async fn execute_capture_comm_open(
-        &mut self,
+        &self,
         code: impl Into<String>,
         target_name: &str,
     ) -> Result<KernelOpenedComm> {
@@ -266,7 +266,7 @@ impl ArkSession {
     }
 
     pub async fn comm_rpc(
-        &mut self,
+        &self,
         comm_id: &str,
         method: &str,
         params: Value,
@@ -318,7 +318,7 @@ impl ArkSession {
             .with_context(|| format!("timed out waiting for comm RPC `{method}`"))?
     }
 
-    pub async fn execute<F>(&mut self, code: impl Into<String>, on_event: F) -> Result<()>
+    pub async fn execute<F>(&self, code: impl Into<String>, on_event: F) -> Result<()>
     where
         F: FnMut(CorrelatedKernelEvent) -> Result<()>,
     {
@@ -332,7 +332,7 @@ impl ArkSession {
     }
 
     pub async fn execute_with_options<F, I>(
-        &mut self,
+        &self,
         code: impl Into<String>,
         mut on_event: F,
         mut on_input: I,
@@ -420,7 +420,7 @@ impl ArkSession {
     }
 
     pub async fn execute_capture_comm_message(
-        &mut self,
+        &self,
         code: impl Into<String>,
         comm_id: &str,
         method: &str,
@@ -446,7 +446,7 @@ impl ArkSession {
             .with_context(|| format!("timed out waiting for comm method `{method}`"))?
     }
 
-    pub async fn interrupt(&mut self) -> Result<()> {
+    pub async fn interrupt(&self) -> Result<()> {
         self.client.interrupt().await.context("interrupting Ark")
     }
 

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rho</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="Rho workbench">
+          <span class="brand-mark">R</span>
+          <span class="brand-name">Rho</span>
+        </div>
+        <nav class="menu" aria-label="主菜单">
+          <button type="button">File</button>
+          <button type="button">Edit</button>
+          <button type="button">Session</button>
+          <button type="button">Tools</button>
+        </nav>
+        <button class="project-switcher" type="button" title="Current project">
+          <span class="project-dot"></span>
+          <span>Rho Prototype</span>
+          <span class="chevron">⌄</span>
+        </button>
+        <div class="work-modes" role="group" aria-label="Workbench layout">
+          <button class="active" data-layout="code" type="button">Code</button>
+          <button data-layout="analyze" type="button">Analyze</button>
+          <button data-layout="agent" type="button">Agent</button>
+        </div>
+        <div class="top-actions">
+          <button id="restartButton" class="icon-button" type="button" title="Restart Workspace R" aria-label="Restart Workspace R">↻</button>
+          <button id="interruptButton" class="icon-button danger" type="button" title="Interrupt R" aria-label="Interrupt R">■</button>
+          <button id="runButton" class="run-button" type="button" title="Run selection or document">
+            <span>▶</span><span>Run</span>
+          </button>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <div class="panel-tabs compact" role="tablist">
+          <button class="active" type="button" data-side-tab="files">Files</button>
+          <button type="button" data-side-tab="runs">Runs</button>
+        </div>
+        <div id="filesPanel" class="side-content">
+          <div class="tree-root"><span class="tree-caret">⌄</span><strong>Rho Prototype</strong></div>
+          <button class="tree-item active" type="button"><span class="file-icon">R</span><span>scratch.R</span><span class="dirty-dot"></span></button>
+          <button class="tree-item" type="button"><span class="file-icon muted">R</span><span>analysis.R</span></button>
+          <div class="tree-section">OUTPUTS</div>
+          <button class="tree-item" type="button"><span class="file-icon plot">▧</span><span>plots</span></button>
+        </div>
+        <div id="runsPanel" class="side-content hidden">
+          <div class="run-row"><span class="run-state success"></span><span><strong>Workspace started</strong><small>Current session</small></span></div>
+          <div class="run-row"><span class="run-state"></span><span><strong>Waiting for execution</strong><small>Agent and user runs</small></span></div>
+        </div>
+        <div class="sidebar-footer">
+          <button type="button" title="Settings" aria-label="Settings">⚙</button>
+          <span>Local workspace</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="editor-region">
+          <div class="document-tabs">
+            <button class="document-tab active" type="button"><span class="r-badge">R</span><span>scratch.R</span><span class="unsaved">●</span></button>
+            <button class="new-tab" type="button" title="New file" aria-label="New file">+</button>
+            <div class="editor-actions">
+              <span id="selectionStatus">R</span>
+              <button id="editorRunButton" type="button" title="Run selection" aria-label="Run selection">▶</button>
+            </div>
+          </div>
+          <div class="editor-wrap">
+            <pre id="lineNumbers" class="line-numbers" aria-hidden="true">1</pre>
+            <textarea id="editor" spellcheck="false" aria-label="R source editor"># Live analysis in Workspace R
+set.seed(42)
+qc <- data.frame(
+  sample = paste0("S", 1:12),
+  reads = round(rlnorm(12, 11.2, 0.35)),
+  detected = round(rnorm(12, 3200, 420))
+)
+
+summary(qc[, c("reads", "detected")])
+plot(
+  qc$reads, qc$detected,
+  pch = 19, col = "#167a72",
+  xlab = "Reads", ylab = "Detected genes",
+  main = "Sample QC"
+)</textarea>
+          </div>
+        </section>
+
+        <section class="execution-dock">
+          <div class="panel-tabs dock-tabs" role="tablist">
+            <button class="active" data-dock-tab="console" type="button">Console</button>
+            <button data-dock-tab="plots" type="button">Plots <span id="plotCount" class="count">0</span></button>
+            <button data-dock-tab="problems" type="button">Problems <span id="problemCount" class="count quiet">0</span></button>
+          </div>
+          <div id="consolePanel" class="dock-content console-panel">
+            <div id="consoleOutput" class="console-output" role="log" aria-live="polite">
+              <div class="console-entry system"><span class="origin">SYSTEM</span><span>Starting Ark-backed Workspace R…</span></div>
+            </div>
+            <div class="console-input"><span class="prompt">›</span><input id="consoleInput" type="text" aria-label="R console input" autocomplete="off" placeholder="R expression" /><button id="consoleRunButton" type="button" title="Execute" aria-label="Execute">↵</button></div>
+          </div>
+          <div id="plotsPanel" class="dock-content plot-panel hidden">
+            <div id="plotEmpty" class="empty-state"><span class="empty-icon">▧</span><strong>No plots yet</strong></div>
+            <img id="plotImage" class="plot-image hidden" alt="Latest R plot" />
+          </div>
+          <div id="problemsPanel" class="dock-content problems-panel hidden">
+            <div id="problemEmpty" class="empty-state"><span class="status-check">✓</span><strong>No problems detected</strong></div>
+            <div id="problemList"></div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="context-panel">
+        <div class="panel-tabs context-tabs" role="tablist">
+          <button class="active" data-context-tab="agent" type="button">Agent</button>
+          <button data-context-tab="environment" type="button">Environment <span id="objectCount" class="count">0</span></button>
+        </div>
+
+        <section id="agentPanel" class="context-content agent-panel">
+          <div class="agent-header">
+            <div><span id="agentStateDot" class="agent-state-dot"></span><strong id="agentState">Ready</strong></div>
+            <span id="revisionBadge" class="revision-badge">rev 1</span>
+          </div>
+          <div id="agentTimeline" class="agent-timeline" aria-live="polite">
+            <div class="timeline-item completed">
+              <span class="timeline-marker">✓</span>
+              <div><strong>Workspace connected</strong><p>Ark session is ready for inspection and execution.</p></div>
+            </div>
+          </div>
+          <div class="agent-composer">
+            <div class="mode-control" role="group" aria-label="Agent mode">
+              <button class="active" data-agent-mode="ask" type="button">Ask</button>
+              <button data-agent-mode="plan" type="button">Plan</button>
+              <button data-agent-mode="act" type="button">Act</button>
+            </div>
+            <textarea id="agentInput" rows="3" aria-label="Ask Rho" placeholder="Ask about the live R workspace…"></textarea>
+            <div class="composer-footer">
+              <span>DeepSeek V4 Flash</span>
+              <button id="agentSendButton" class="send-button" type="button" title="Send" aria-label="Send">↑</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="environmentPanel" class="context-content environment-panel hidden">
+          <div class="environment-toolbar">
+            <input id="environmentSearch" type="search" placeholder="Filter objects" aria-label="Filter workspace objects" />
+            <button id="refreshEnvironment" type="button" title="Refresh Environment" aria-label="Refresh Environment">↻</button>
+          </div>
+          <div class="environment-head"><span>Name</span><span>Type</span><span>Size</span></div>
+          <div id="environmentList" class="environment-list">
+            <div class="empty-state compact-empty"><strong>Workspace is empty</strong></div>
+          </div>
+        </section>
+      </aside>
+
+      <footer class="statusbar">
+        <div><span id="kernelDot" class="kernel-dot starting"></span><span id="kernelStatus">Starting R…</span></div>
+        <div class="status-spacer"></div>
+        <span id="stateRevision">state 1</span>
+        <span id="projectRevision">project 0</span>
+        <span id="rVersion">R</span>
+        <span>UTF-8</span>
+        <span>Ln <b id="cursorLine">1</b>, Col <b id="cursorColumn">1</b></span>
+      </footer>
+    </div>
+    <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
