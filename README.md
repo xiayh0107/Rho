@@ -55,13 +55,16 @@ Current evidence and remaining Phase 0 gates are tracked in
 The first installable Tauri prototype is available at:
 
 ```text
-target\release\bundle\nsis\Rho_0.1.0_x64-setup.exe
+target\release\bundle\nsis\Rho_0.1.1_x64-setup.exe
 ```
 
 It provides a live R editor and Console, Environment, real plot output,
 Problems, and an Ask/Plan/Act Agent panel backed by DeepSeek and the same Ark
 Workspace R. Ark and its Windows WebView loader are included in the installer;
 the machine must already provide R, and aisdk is required only for Agent turns.
+The Files, Agent/Environment and Console/Plots/Problems regions have draggable
+dividers. Panel sizes persist locally, and the execution panel can be expanded
+or restored from its toolbar.
 
 Build it with:
 

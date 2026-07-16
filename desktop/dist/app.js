@@ -340,6 +340,139 @@ function switchContextTab(name) {
   $("#environmentPanel").classList.toggle("hidden", name !== "environment");
 }
 
+const panelDefaults = {
+  left: 214,
+  right: 362,
+  dock: 260,
+};
+
+function clamp(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function panelLimits() {
+  const shell = $(".app-shell").getBoundingClientRect();
+  const workspace = $(".workspace").getBoundingClientRect();
+  return {
+    left: [160, Math.min(380, shell.width - 760)],
+    right: [280, Math.min(620, shell.width - 640)],
+    dock: [130, Math.max(130, workspace.height - 156)],
+  };
+}
+
+function setPanelSize(panel, requested, persist = true) {
+  const limits = panelLimits()[panel];
+  const value = Math.round(clamp(requested, limits[0], limits[1]));
+  const property = panel === "left"
+    ? "--left-pane-width"
+    : panel === "right"
+      ? "--right-pane-width"
+      : "--dock-height";
+  $(".app-shell").style.setProperty(property, `${value}px`);
+  const handle = panel === "left" ? $("#leftResizeHandle") : panel === "right" ? $("#rightResizeHandle") : $("#dockResizeHandle");
+  handle.setAttribute("aria-valuenow", String(value));
+  if (persist) localStorage.setItem(`rho.panel.${panel}`, String(value));
+  return value;
+}
+
+function setupPanelResizer(handle, panel) {
+  let startingPointer = 0;
+  let startingSize = 0;
+  let active = false;
+  let inputType = null;
+  const isDock = panel === "dock";
+
+  const begin = (event, type) => {
+    if (active || event.button !== 0) return;
+    active = true;
+    inputType = type;
+    startingPointer = isDock ? event.clientY : event.clientX;
+    startingSize = Number(handle.getAttribute("aria-valuenow"));
+    if (type === "pointer") {
+      try {
+        handle.setPointerCapture(event.pointerId);
+      } catch {
+        inputType = "mouse";
+      }
+    }
+    handle.classList.add("active");
+    document.body.classList.add("resizing", isDock ? "resizing-horizontal" : "resizing-vertical");
+    event.preventDefault();
+  };
+
+  const move = (event, type) => {
+    if (type !== inputType) return;
+    if (!active) return;
+    const pointer = isDock ? event.clientY : event.clientX;
+    const delta = pointer - startingPointer;
+    const requested = panel === "left"
+      ? startingSize + delta
+      : startingSize - delta;
+    setPanelSize(panel, requested);
+  };
+
+  const stop = (event) => {
+    if (!active) return;
+    active = false;
+    if (event.pointerId !== undefined && handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    handle.classList.remove("active");
+    document.body.classList.remove("resizing", "resizing-horizontal", "resizing-vertical");
+    inputType = null;
+  };
+  handle.addEventListener("pointerdown", (event) => begin(event, "pointer"));
+  handle.addEventListener("pointermove", (event) => move(event, "pointer"));
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+  handle.addEventListener("mousedown", (event) => begin(event, "mouse"));
+  document.addEventListener("mousemove", (event) => move(event, "mouse"));
+  document.addEventListener("mouseup", stop);
+  handle.addEventListener("dblclick", () => setPanelSize(panel, panelDefaults[panel]));
+  handle.addEventListener("keydown", (event) => {
+    const current = Number(handle.getAttribute("aria-valuenow"));
+    const amount = event.shiftKey ? 40 : 12;
+    let delta = 0;
+    if (panel === "left" && event.key === "ArrowLeft") delta = -amount;
+    if (panel === "left" && event.key === "ArrowRight") delta = amount;
+    if (panel === "right" && event.key === "ArrowLeft") delta = amount;
+    if (panel === "right" && event.key === "ArrowRight") delta = -amount;
+    if (panel === "dock" && event.key === "ArrowUp") delta = amount;
+    if (panel === "dock" && event.key === "ArrowDown") delta = -amount;
+    if (!delta) return;
+    event.preventDefault();
+    setPanelSize(panel, current + delta);
+  });
+}
+
+function initializePanelLayout() {
+  for (const panel of ["left", "right", "dock"]) {
+    const stored = Number(localStorage.getItem(`rho.panel.${panel}`));
+    setPanelSize(panel, Number.isFinite(stored) && stored > 0 ? stored : panelDefaults[panel], false);
+  }
+  setupPanelResizer($("#leftResizeHandle"), "left");
+  setupPanelResizer($("#rightResizeHandle"), "right");
+  setupPanelResizer($("#dockResizeHandle"), "dock");
+}
+
+function toggleDockMaximize() {
+  const button = $("#toggleDockMaximize");
+  const expanded = button.dataset.expanded === "true";
+  if (expanded) {
+    const previous = Number(button.dataset.previousHeight) || panelDefaults.dock;
+    setPanelSize("dock", previous);
+    button.dataset.expanded = "false";
+    button.textContent = "⤢";
+    button.title = "Expand execution panel";
+    button.setAttribute("aria-label", "Expand execution panel");
+    return;
+  }
+  button.dataset.previousHeight = $("#dockResizeHandle").getAttribute("aria-valuenow");
+  setPanelSize("dock", panelLimits().dock[1]);
+  button.dataset.expanded = "true";
+  button.textContent = "⤡";
+  button.title = "Restore execution panel";
+  button.setAttribute("aria-label", "Restore execution panel");
+}
+
 function updateEditorChrome() {
   const editor = $("#editor");
   const lines = editor.value.split("\n").length;
@@ -359,6 +492,7 @@ function toast(message, error = false) {
 }
 
 async function initialize() {
+  initializePanelLayout();
   const saved = localStorage.getItem("rho.scratch");
   if (saved) $("#editor").value = saved;
   updateEditorChrome();
@@ -434,6 +568,13 @@ $("#agentInput").addEventListener("keydown", (event) => {
 });
 $("#refreshEnvironment").addEventListener("click", refreshEnvironment);
 $("#environmentSearch").addEventListener("input", renderEnvironment);
+$("#toggleDockMaximize").addEventListener("click", toggleDockMaximize);
+window.addEventListener("resize", () => {
+  for (const panel of ["left", "right", "dock"]) {
+    const handle = panel === "left" ? $("#leftResizeHandle") : panel === "right" ? $("#rightResizeHandle") : $("#dockResizeHandle");
+    setPanelSize(panel, Number(handle.getAttribute("aria-valuenow")), false);
+  }
+});
 $("#interruptButton").addEventListener("click", async () => {
   try {
     await invoke("interrupt_r");

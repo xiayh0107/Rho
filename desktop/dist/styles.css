@@ -18,6 +18,9 @@
   --console-ink: #dce6e8;
   --danger: #bd4b45;
   --warning: #b27816;
+  --left-pane-width: 214px;
+  --right-pane-width: 362px;
+  --dock-height: 260px;
 }
 
 * { box-sizing: border-box; }
@@ -29,8 +32,9 @@ button { color: inherit; }
 button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid #4b9f98; outline-offset: -1px; }
 
 .app-shell {
+  position: relative;
   display: grid;
-  grid-template-columns: 214px minmax(520px, 1fr) 362px;
+  grid-template-columns: var(--left-pane-width) minmax(420px, 1fr) var(--right-pane-width);
   grid-template-rows: 46px minmax(0, 1fr) 24px;
   width: 100vw;
   height: 100vh;
@@ -197,7 +201,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   grid-column: 2;
   grid-row: 2;
   display: grid;
-  grid-template-rows: minmax(320px, 1fr) 260px;
+  grid-template-rows: minmax(150px, 1fr) 6px var(--dock-height);
   background: var(--panel);
 }
 .editor-region { display: flex; flex-direction: column; min-height: 0; }
@@ -215,9 +219,59 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 #editor { width: 100%; height: 100%; min-width: 0; padding: 18px 20px; resize: none; border: 0; outline: 0; color: #223036; background: #fff; font: 13px/1.62 "Cascadia Code", Consolas, monospace; tab-size: 2; white-space: pre; overflow: auto; }
 #editor::selection { background: #bfe1dd; }
 
-.execution-dock { display: flex; flex-direction: column; min-height: 0; border-top: 1px solid var(--border-strong); }
+.execution-dock { display: flex; flex-direction: column; min-height: 0; }
 .dock-tabs { flex-basis: 35px; height: 35px; }
 .dock-tabs button { height: 35px; }
+.dock-actions { display: flex; align-items: center; margin-left: auto; }
+.dock-actions button {
+  display: grid;
+  place-items: center;
+  width: 29px;
+  min-width: 29px;
+  height: 27px;
+  padding: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 16px;
+}
+.dock-actions button:hover { background: #e8eeee; color: var(--ink); }
+.dock-actions button::after { display: none; }
+
+.resize-handle {
+  z-index: 12;
+  touch-action: none;
+  user-select: none;
+}
+.resize-handle::after {
+  position: absolute;
+  background: var(--border-strong);
+  content: "";
+  transition: background 120ms ease;
+}
+.resize-handle:hover::after,
+.resize-handle:focus-visible::after,
+body.resizing .resize-handle.active::after { background: var(--accent); }
+.resize-handle.vertical {
+  position: absolute;
+  top: 46px;
+  bottom: 24px;
+  width: 7px;
+  cursor: col-resize;
+}
+.resize-handle.vertical::after { top: 0; bottom: 0; left: 3px; width: 1px; }
+.left-handle { left: calc(var(--left-pane-width) - 3px); }
+.right-handle { right: calc(var(--right-pane-width) - 3px); }
+.resize-handle.horizontal {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  cursor: row-resize;
+  background: #f4f7f7;
+}
+.resize-handle.horizontal::after { top: 2px; right: 0; left: 0; height: 1px; }
+body.resizing { user-select: none; }
+body.resizing-horizontal { cursor: row-resize; }
+body.resizing-vertical { cursor: col-resize; }
 .count { display: inline-grid; place-items: center; min-width: 17px; height: 17px; margin-left: 4px; padding: 0 4px; border-radius: 8px; color: #48605f; background: #dfe9e8; font-size: 10px; }
 .count.quiet { color: var(--muted); background: #e8ecec; }
 .dock-content { flex: 1; min-height: 0; overflow: auto; }
@@ -304,7 +358,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .hidden { display: none !important; }
 
 @media (max-width: 1180px) {
-  .app-shell { grid-template-columns: 180px minmax(480px, 1fr) 320px; }
+  .app-shell { --left-pane-width: 180px; --right-pane-width: 320px; }
   .menu { display: none; }
   .project-switcher { min-width: 150px; }
 }
@@ -312,6 +366,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 @media (max-width: 960px) {
   .app-shell { grid-template-columns: minmax(0, 1fr) 330px; }
   .sidebar { display: none; }
+  .left-handle { display: none; }
+  .right-handle { right: 327px; }
   .workspace { grid-column: 1; }
   .context-panel { grid-column: 2; }
   .project-switcher { display: none; }

@@ -60,6 +60,8 @@
         </div>
       </aside>
 
+      <div id="leftResizeHandle" class="resize-handle vertical left-handle" role="separator" aria-label="Resize Files panel" aria-orientation="vertical" aria-valuemin="160" aria-valuemax="380" tabindex="0"></div>
+
       <main class="workspace">
         <section class="editor-region">
           <div class="document-tabs">
@@ -90,11 +92,16 @@ plot(
           </div>
         </section>
 
+        <div id="dockResizeHandle" class="resize-handle horizontal dock-handle" role="separator" aria-label="Resize execution panel" aria-orientation="horizontal" aria-valuemin="130" tabindex="0"></div>
+
         <section class="execution-dock">
           <div class="panel-tabs dock-tabs" role="tablist">
             <button class="active" data-dock-tab="console" type="button">Console</button>
             <button data-dock-tab="plots" type="button">Plots <span id="plotCount" class="count">0</span></button>
             <button data-dock-tab="problems" type="button">Problems <span id="problemCount" class="count quiet">0</span></button>
+            <div class="dock-actions">
+              <button id="toggleDockMaximize" type="button" title="Expand execution panel" aria-label="Expand execution panel">&#x2922;</button>
+            </div>
           </div>
           <div id="consolePanel" class="dock-content console-panel">
             <div id="consoleOutput" class="console-output" role="log" aria-live="polite">
@@ -112,6 +119,8 @@ plot(
           </div>
         </section>
       </main>
+
+      <div id="rightResizeHandle" class="resize-handle vertical right-handle" role="separator" aria-label="Resize Agent panel" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="620" tabindex="0"></div>
 
       <aside class="context-panel">
         <div class="panel-tabs context-tabs" role="tablist">

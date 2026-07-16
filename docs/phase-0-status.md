@@ -14,7 +14,9 @@ Jet revision: `52ae131dd168fe2e104d306cc4bf5bbeae749200`
   development tree.
 - The prototype exposes a live source editor and Console, Environment object
   manifest, PNG plot output, structured Problems, revision status, interrupt
-  and restart controls, plus an Ask/Plan/Act Agent timeline.
+  and restart controls, plus an Ask/Plan/Act Agent timeline. The Files,
+  execution and context regions now have draggable, persistent dividers; the
+  execution panel also supports one-click expand and restore.
 - Desktop backend smoke tests create a data frame in Workspace R, receive a
   real plot and Environment object, then complete a read-only DeepSeek turn
   against the same Ark session. Browser UI checks cover 1280 by 720 and the

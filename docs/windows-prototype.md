@@ -7,7 +7,7 @@ Date: 2026-07-16
 The current internal prototype installer is generated at:
 
 ```text
-D:\Rho\target\release\bundle\nsis\Rho_0.1.0_x64-setup.exe
+D:\Rho\target\release\bundle\nsis\Rho_0.1.1_x64-setup.exe
 ```
 
 It is an unsigned 64-bit NSIS installer. Windows SmartScreen may therefore
@@ -43,9 +43,11 @@ in a nonstandard location.
 2. The bundled Ark binary starts one persistent authoritative Workspace R.
 3. The source editor and Console execute against that same session.
 4. Structured output populates Console, Problems, Plots and Environment.
-5. Ask and Plan are read-only Agent modes. Act may approve `run_r` calls.
-6. Agent R uses `YuLab-SMU/aisdk` and broker tools against the same Workspace R.
-7. The broker persists execution and agent events in its SQLite store.
+5. Horizontal and vertical dividers resize the execution, Files and context
+   panels; sizes persist locally and the execution panel has expand/restore.
+6. Ask and Plan are read-only Agent modes. Act may approve `run_r` calls.
+7. Agent R uses `YuLab-SMU/aisdk` and broker tools against the same Workspace R.
+8. The broker persists execution and agent events in its SQLite store.
 
 The installed build was verified to launch Ark from:
 
@@ -70,7 +72,8 @@ runs a DeepSeek read-only turn against that live workspace.
 
 Browser-mode UI verification covers 1280 by 720 and the minimum 1024 by 680
 window size. Run, Plots, Environment and the Act-mode Agent timeline were
-exercised without incoherent overlap.
+exercised without incoherent overlap. Resizer keyboard controls, persisted
+sizes, execution-panel expansion and minimum-window clamping are also covered.
 
 ## Deliberately deferred
 
@@ -87,3 +90,12 @@ exercised without incoherent overlap.
 
 These are productization items, not blockers for evaluating the Windows
 workbench shape and the shared Workspace R/Agent R architecture.
+
+## Panel interaction
+
+The execution dock is separated from the editor by a draggable horizontal
+divider. Drag it upward to inspect a larger Plot or Problems surface; drag it
+downward to return more space to the editor. Double-click the divider restores
+the default height. The Files and Agent/Environment columns have equivalent
+vertical dividers. All three sizes persist locally, support keyboard arrow
+adjustment when focused, and the execution dock has an expand/restore button.
