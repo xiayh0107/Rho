@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, oneshot};
 
+use crate::policy::{PolicyAction, PolicyDecision, PolicyEngine, PolicyPrincipal};
+
 pub struct CoordinatorRuntime {
     pub broker: BrokerState,
     pub store: Store,
@@ -102,7 +104,7 @@ pub async fn probe(
 
     let mut session = ArkSession::launch(&ArkLaunchConfig::new(kernelspec)).await?;
     let run_result = run_probe(
-        &mut session,
+        &session,
         &mut broker,
         &mut store,
         rscript,
@@ -1026,10 +1028,24 @@ fn authorize_agent_workspace_request(
     payload: &Value,
     approved_mutations: &mut HashMap<String, ApprovedMutation>,
 ) -> Result<()> {
+    let action = PolicyAction::from_workspace_request(request_type)
+        .with_context(|| format!("Agent request type `{request_type}` is not allowed by policy"))?;
+    let principal = if mode == "act" {
+        PolicyPrincipal::InternalAgentAct
+    } else {
+        PolicyPrincipal::InternalAgentReadOnly
+    };
+    let decision = PolicyEngine::evaluate(principal, action);
     match request_type {
-        "workspace.snapshot" | "workspace.inspect_object" => Ok(()),
+        "workspace.snapshot" | "workspace.inspect_object" => {
+            ensure!(decision == PolicyDecision::Automatic);
+            Ok(())
+        }
         "workspace.execute" => {
-            ensure!(mode == "act", "{mode} mode cannot mutate Workspace R");
+            ensure!(
+                decision == PolicyDecision::RequireBrokerApproval,
+                "{mode} mode cannot mutate Workspace R"
+            );
             let request_id = payload
                 .get("approval_request_id")
                 .and_then(Value::as_str)

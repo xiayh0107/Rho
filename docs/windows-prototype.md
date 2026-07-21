@@ -1,5 +1,9 @@
 # Windows prototype
 
+> Historical prototype: the current desktop target is a thin `rho-server` plus
+> WebView wrapper. The editor-centric UI described below is no longer the
+> product architecture.
+
 Date: 2026-07-16
 
 ## Installer

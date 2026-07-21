@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "rho",
+  "displayName": "Rho Scientific Runtime",
+  "description": "Connect Claude Code to Rho's trusted R workspace, scientific objects, runs, problems, plots, and provenance.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Rho contributors"
+  },
+  "repository": "https://github.com/xiayh0107/Rho",
+  "license": "MIT",
+  "keywords": ["r", "science", "mcp", "provenance"]
+}

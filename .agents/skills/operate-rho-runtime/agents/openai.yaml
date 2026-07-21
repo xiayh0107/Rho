@@ -1,0 +1,7 @@
+interface:
+  display_name: "Operate Rho Runtime"
+  short_description: "Run trusted scientific R workflows through Rho"
+  default_prompt: "Use $operate-rho-runtime to inspect this R workspace and execute a provenance-aware analysis."
+
+policy:
+  allow_implicit_invocation: true

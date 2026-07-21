@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use rho_protocol::{Envelope, WorkspaceIdentity};
+use rho_protocol::{Envelope, MessageKind, PROTOCOL_VERSION, Workspace, WorkspaceIdentity};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -271,6 +271,12 @@ pub struct AgentTurnDetail {
     pub approvals: Vec<ApprovalRequestSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoredEvent {
+    pub sequence: i64,
+    pub envelope: Envelope,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -524,10 +530,83 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn save_workspace(&mut self, workspace: &Workspace) -> Result<(), StoreError> {
+        let workspace_payload = serde_json::to_string(workspace)?;
+        let identity_payload = serde_json::to_string(&workspace.identity)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO workspace_identity(singleton, payload) VALUES(1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET payload = excluded.payload",
+            [identity_payload],
+        )?;
+        transaction.execute(
+            "INSERT INTO metadata(key, value) VALUES('workbench_workspace', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [workspace_payload],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_workspace(&self) -> Result<Option<Workspace>, StoreError> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'workbench_workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
     pub fn event_count(&self) -> Result<u64, StoreError> {
         self.connection
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .map_err(StoreError::from)
+    }
+
+    pub fn list_events(
+        &self,
+        after_sequence: i64,
+        limit: Option<usize>,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, event_id, timestamp, kind, payload
+             FROM events
+             WHERE seq > ?1
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![after_sequence, limit.unwrap_or(DEFAULT_LIMIT) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (sequence, id, timestamp, kind, payload) = row?;
+            Ok(StoredEvent {
+                sequence,
+                envelope: Envelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    id,
+                    kind: serde_json::from_str::<MessageKind>(&kind)?,
+                    timestamp,
+                    payload: serde_json::from_str(&payload)?,
+                },
+            })
+        })
+        .collect()
     }
 
     pub fn create_run(&mut self, draft: &RunDraft) -> Result<(), StoreError> {
@@ -1283,7 +1362,7 @@ fn text_preview(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rho_protocol::{MessageKind, WorkspaceIdentity};
+    use rho_protocol::{DeepLink, MessageKind, Workspace, WorkspaceIdentity, WorkspaceLifecycle};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1298,6 +1377,33 @@ mod tests {
         let event = Envelope::new(MessageKind::Event, json!({"kind": "test"}));
         assert_eq!(store.append_event(&event).unwrap(), 1);
         assert_eq!(store.event_count().unwrap(), 1);
+        assert_eq!(
+            store.list_events(0, None).unwrap(),
+            vec![StoredEvent {
+                sequence: 1,
+                envelope: event,
+            }]
+        );
+        assert!(store.list_events(1, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persists_the_workbench_workspace_atomically_with_identity() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path().join("rho.sqlite")).unwrap();
+        let identity = WorkspaceIdentity::new("ws_test");
+        let workspace = Workspace {
+            workspace_id: identity.workspace_id.clone(),
+            lifecycle: WorkspaceLifecycle::Disconnected,
+            identity: identity.clone(),
+            project_root: Some("/project".to_string()),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+            updated_at: "2026-07-20T00:00:00Z".to_string(),
+            deep_link: DeepLink::workspace(&identity.workspace_id).unwrap(),
+        };
+        store.save_workspace(&workspace).unwrap();
+        assert_eq!(store.load_workspace().unwrap(), Some(workspace));
+        assert_eq!(store.load_identity().unwrap(), Some(identity));
     }
 
     #[test]

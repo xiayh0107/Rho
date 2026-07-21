@@ -47,6 +47,10 @@ impl BrokerState {
         }
     }
 
+    pub fn from_identity(identity: WorkspaceIdentity) -> Self {
+        Self { identity }
+    }
+
     pub fn identity(&self) -> &WorkspaceIdentity {
         &self.identity
     }
@@ -98,5 +102,13 @@ mod tests {
             broker.authorize(&agent_request),
             Err(StaleWorkspace::State { .. })
         ));
+    }
+
+    #[test]
+    fn restores_a_persisted_workspace_identity() {
+        let mut identity = WorkspaceIdentity::new("ws_persisted");
+        identity.apply(OperationClass::StateCapable);
+        let broker = BrokerState::from_identity(identity.clone());
+        assert_eq!(broker.identity(), &identity);
     }
 }

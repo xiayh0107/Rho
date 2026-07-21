@@ -1,82 +1,108 @@
 # Rho
 
-Rho is an agent-native scientific workbench for R. Phase 0 validates a no-Python architecture with:
+Rho is an Agent-native scientific runtime for R.
 
-- Ark as the authoritative Workspace R kernel;
-- a Rust broker using the Jupyter wire protocol directly;
-- a separate Agent R process powered by `YuLab-SMU/aisdk`;
-- typed workspace identities, a broker-owned SQLite event store, and structured output.
+Use Claude Code, Codex, Copilot, or any MCP-capable Agent for reasoning and planning. Rho provides the trusted scientific workspace underneath: persistent R state, semantic object inspection, policy-controlled execution, artifacts, and provenance.
 
-Agent R builds on the existing `YuLab-SMU/aisdk` package family. Rho reuses
-`ChatSession`, streaming events, run traces, hooks, run states and branching;
-`aisdk.console` is the reference frontend and developer fallback, not an
-embedded terminal UI. See `docs/architecture/aisdk-family-integration.md`.
-Proposed reusable changes to the family packages are listed in
-`docs/architecture/aisdk-family-change-proposals.md`.
+> Agent thinks. Rho executes and proves.
 
-## Phase 0 commands
+## Product boundary
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/bootstrap-ark-windows.ps1
-cargo test --workspace
-cargo run -p rho-server -- doctor
-cargo run -p rho-server -- probe-agent-r
-cargo run -p rho-server -- probe-ark --kernelspec .rho/runtime/ark-0.1.252/kernel.json --code "1 + 1"
-cargo run -p rho-server -- probe-coordinator --kernelspec .rho/runtime/ark-0.1.252/kernel.json
-cargo run -p rho-server -- probe-completeness --kernelspec .rho/runtime/ark-0.1.252/kernel.json
-cargo run -p rho-server -- probe-comms --kernelspec .rho/runtime/ark-0.1.252/kernel.json
-cargo run -p rho-server -- probe-rich-output --kernelspec .rho/runtime/ark-0.1.252/kernel.json
-```
-
-An opt-in real-model coordinator probe can be run when the selected provider
-credential is available to Agent R:
-
-```powershell
-cargo run -p rho-server -- probe-coordinator --kernelspec .rho/runtime/ark-0.1.252/kernel.json --store .rho/state/coordinator-probe-deepseek.sqlite --model deepseek:deepseek-v4-flash
-```
-
-This path has been verified end to end: DeepSeek requested one approved
-`run_r` call, Ark created a live Workspace R object with value 42, and a
-subsequent broker-backed inspection succeeded. Model credentials are not sent
-to Workspace R, and broker-reported Agent diagnostics are secret-redacted.
-
-The Windows bootstrap downloads the pinned Ark binary, verifies its SHA-256,
-and writes a broker-private kernelspec with explicit `R_HOME`, `R_LIBS` and R
-DLL search paths. It does not install Python or Jupyter.
-On Windows, Rust can use either MSVC Build Tools or the GNU host toolchain with
-the GCC linker already provided by Rtools.
-
-The full reviewed implementation plan is in `Rho-implementation-plan.md`.
-Current evidence and remaining Phase 0 gates are tracked in
-`docs/phase-0-status.md`.
-Release changes are recorded in `NEWS.md`; the active post-prototype roadmap
-is in `docs/development-roadmap.md`.
-The implementation handoff for the remaining `0.2.x` work is in
-`docs/0.2x-agent-handoff.md`.
-The verified Windows toolchain, packaging procedure and acceptance checklist
-are documented in `docs/windows-build-environment.md`.
-
-## Windows prototype
-
-The first installable Tauri prototype is available at:
+Rho is not another general AI IDE and the browser is not the source of truth.
 
 ```text
-target\release\bundle\nsis\Rho_0.2.0-dev.2_x64-setup.exe
+Codex · Claude Code · MCP clients · rho CLI · Browser · Desktop wrapper
+                              │
+                  Rho Workbench Protocol 0.1
+                    HTTP · WebSocket · JSON
+                              │
+                         rho-server
+             lifecycle · policy · events · provenance
+                              │
+                    authoritative Workspace R
+                              │
+                             Ark
 ```
 
-It provides a live R editor and Console, Environment, real plot output,
-Problems, and an Ask/Plan/Act Agent panel backed by DeepSeek and the same Ark
-Workspace R. Ark and its Windows WebView loader are included in the installer;
-the machine must already provide R, and aisdk is required only for Agent turns.
-The Files, Agent/Environment and Console/Plots/Problems regions have draggable
-dividers. Panel sizes persist locally, and the execution panel can be expanded
-or restored from its toolbar.
+The runtime persists independently of browser refreshes and Agent reconnections. Every client projects the same `Workspace`, `Run`, `Object`, `Artifact`, `Problem`, `Approval`, and `Provenance` entities.
 
-Build it with:
+## Start a workspace
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1
+The control plane can start without a kernel, which is useful for protocol and client development:
+
+```sh
+cargo run -p rho-server -- serve --project-root .
 ```
 
-Installation prerequisites, verified behavior and intentionally deferred
-features are documented in `docs/windows-prototype.md`.
+For live R execution, attach the intended Ark kernelspec:
+
+```sh
+cargo run -p rho-server -- serve \
+  --project-root . \
+  --kernelspec /path/to/ark/kernel.json
+```
+
+Open <http://127.0.0.1:8787>. The browser exposes Runs, Objects, Plots, Problems, Approvals, and Provenance; it deliberately does not recreate a full IDE.
+
+## Agent and CLI access
+
+This repository includes project-scoped integrations for both Codex and Claude Code:
+
+- Codex: `.codex/config.toml` and `.agents/skills/operate-rho-runtime`
+- Claude Code: `.mcp.json`, `.claude/skills/rho-runtime`, and the distributable plugin in `integrations/claude-code/rho`
+- Shared instructions: `integrations/templates/AGENTS.md`
+
+Bootstrap another R project after installing the two client binaries:
+
+```sh
+cargo install --path crates/rho-cli
+cargo install --path crates/rho-mcp
+
+rho init codex --project /path/to/project
+rho init claude --project /path/to/project
+```
+
+The bootstrap detects `.Rproj`, `DESCRIPTION`, `renv.lock`, `.Rprofile`, and `R/` markers. It refuses to overwrite existing Agent configuration unless `--force` is explicit.
+
+The CLI has stable JSON envelopes for Agent use:
+
+```sh
+rho status --json
+rho run analysis.R --json
+rho objects --json
+rho inspect OBJECT --json
+rho problems --json
+rho plots list --json
+```
+
+`rho-mcp` exposes scientific semantics rather than Ark or internal broker RPC: `workspace_open`, `workspace_status`, `workspace_execute`, `object_inspect`, `run_history`, `problem_list`, `artifact_export`, and `plot_view`.
+
+## Scientific semantics and evidence
+
+Rho provides bounded viewers for data frames, Seurat, SummarizedExperiment, SingleCellExperiment, GRanges, and ggplot objects. A provenance graph connects code, parameters, runtime environment, state revisions, objects, artifacts, and execution times.
+
+Inspection, summarization, and visualization are read-only. Mutating R execution goes through the same policy model whether it originates in the browser, CLI, MCP host, or an internal Agent action. Package installation, file overwrite, shell execution, and data upload remain protected action classes.
+
+## Remote and desktop projections
+
+Project a remote runtime through a local same-origin browser/API gateway:
+
+```sh
+cargo run -p rho-server -- gateway \
+  --upstream https://rho.example.org \
+  --port 8787
+```
+
+The gateway forwards Workbench HTTP and WebSocket traffic while serving the same browser control plane locally. Runtime identity and scientific state remain upstream. Deployment profiles for a local machine, SSH Linux server, scheduler job, and cloud endpoint are documented in [docs/remote-runtime.md](docs/remote-runtime.md).
+
+The optional Tauri desktop app is only a launcher: it starts `rho-server`, embeds the browser control plane, supplies a tray, startup notifications, and `.Rproj` file association. It contains no separate editor, project state, or scientific execution path.
+
+## Verify the workspace
+
+```sh
+cargo test --workspace
+Rscript -e 'testthat::test_local("r/rho.bridge", reporter = "summary")'
+node --check web/app.js
+```
+
+Architecture decisions are in [docs/decisions](docs/decisions/README.md), the client workflow is in [docs/integrations/agent-workflows.md](docs/integrations/agent-workflows.md), and release changes are in [NEWS.md](NEWS.md).

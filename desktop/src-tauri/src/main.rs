@@ -1,1153 +1,274 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod project;
-
-use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
-use project::{
-    ProjectRestoreResponse, ProjectSessionSnapshot, ProjectSessionStore, ProjectState,
-    ProjectWatcherControl, default_project_root, ensure_editable_file, list_project_files,
-    normalize_existing_project_root, project_path, replace_project_watcher, validate_project_root,
-};
-use rho_core::{BrokerState, ExecutionOrigin};
-use rho_kernel::{ArkLaunchConfig, ArkSession};
-use rho_server::coordinator::{
-    ApprovalResponseInput, CoordinatorRuntime, PendingApprovalRegistry, bootstrap_bridge,
-    dispatch_workspace_request, run_agent_turn,
-};
-use rho_store::{
-    AgentTurnDetail, AgentTurnDraft, AgentTurnEventDraft, AgentTurnSummary, ApprovalRequestSummary,
-    PlotArtifactSummary, ProblemSummary, RunDetail, RunSummary, Store,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::{Mutex, RwLock, oneshot};
-use uuid::Uuid;
+use anyhow::{Context, Result, ensure};
+use rho_server::runtime::{RuntimeService, RuntimeServiceConfig};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 
-const BRIDGE_STATE: &str = include_str!("../../../r/rho.bridge/R/state.R");
-const BRIDGE_EXECUTE: &str = include_str!("../../../r/rho.bridge/R/execute.R");
-const BRIDGE_WORKSPACE: &str = include_str!("../../../r/rho.bridge/R/workspace.R");
-const AGENT_STATE: &str = include_str!("../../../r/rho.agent/R/aaa-state.R");
-const AGENT_TRANSPORT: &str = include_str!("../../../r/rho.agent/R/transport.R");
-const AGENT_ADAPTER: &str = include_str!("../../../r/rho.agent/R/aisdk_adapter.R");
-#[derive(Clone)]
-struct RuntimeConfig {
-    data_dir: PathBuf,
-    kernelspec: PathBuf,
-    rscript: PathBuf,
-    bridge_package: PathBuf,
-    agent_package: PathBuf,
-    store_path: PathBuf,
+#[derive(Debug, Default, Eq, PartialEq)]
+struct LaunchOptions {
+    project_root: Option<PathBuf>,
+    kernelspec: Option<PathBuf>,
+    bridge_package: Option<PathBuf>,
 }
 
-struct AppState {
-    config: RuntimeConfig,
-    project_store: ProjectSessionStore,
-    project_root: RwLock<PathBuf>,
-    project_watcher: Mutex<Option<ProjectWatcherControl>>,
-    session: RwLock<Option<Arc<ArkSession>>>,
-    context: Mutex<Option<Arc<Mutex<CoordinatorRuntime>>>>,
-    approvals: Arc<PendingApprovalRegistry>,
-    agent_tasks: Arc<Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>>,
-}
-
-#[derive(Serialize)]
-struct WorkspaceStatus {
-    status: &'static str,
-    r_version: String,
-    r_home: String,
-    kernel_pid: Option<u32>,
-    workspace: Option<Value>,
-    python_required: bool,
-}
-
-#[derive(Deserialize)]
-struct ExecuteRequest {
-    code: String,
-    source_path: Option<String>,
-    execution_mode: Option<String>,
-    document_version: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct InspectObjectRequest {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct RenderRequest {
-    path: String,
-    format: Option<String>,
-    document_version: Option<i64>,
-}
-
-#[tauri::command]
-async fn workspace_start(state: State<'_, AppState>) -> Result<WorkspaceStatus, String> {
-    start_workspace(&state).await.map_err(display_error)
-}
-
-#[tauri::command]
-async fn workspace_status(state: State<'_, AppState>) -> Result<Value, String> {
-    let session = state.session.read().await.clone();
-    let context = state.context.lock().await.clone();
-    let workspace = if let Some(context) = context {
-        let context = context.lock().await;
-        Some(serde_json::to_value(context.broker.identity()).unwrap_or(Value::Null))
-    } else {
-        None
-    };
-    Ok(json!({
-        "status": if session.is_some() { "idle" } else { "disconnected" },
-        "kernel_pid": session.as_ref().and_then(|value| value.child_pid()),
-        "workspace": workspace,
-        "python_required": false
-    }))
-}
-
-#[tauri::command]
-async fn project_state(state: State<'_, AppState>) -> Result<ProjectState, String> {
-    let root = state.project_root.read().await.clone();
-    list_project_files(&root).map_err(display_error)
-}
-
-#[tauri::command]
-async fn project_open(
-    path: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ProjectRestoreResponse, String> {
-    let root = validate_project_root(Path::new(&path)).map_err(display_error)?;
-    let session_snapshot = state.project_store.load_session_or_default(&root);
-    switch_project(root, Some(session_snapshot), app, &state)
-        .await
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn project_pick_directory(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ProjectRestoreResponse, String> {
-    let Some(path) = rfd::FileDialog::new().pick_folder() else {
-        return Ok(ProjectRestoreResponse::cancelled());
-    };
-    let root = normalize_existing_project_root(&path).map_err(display_error)?;
-    let session_snapshot = state.project_store.load_session_or_default(&root);
-    switch_project(root, Some(session_snapshot), app, &state)
-        .await
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn project_restore_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ProjectRestoreResponse, String> {
-    let requested_root = state
-        .project_store
-        .last_opened_project()
-        .map_err(display_error)?
-        .unwrap_or_else(default_project_root);
-    let root = match normalize_existing_project_root(&requested_root) {
-        Ok(root) => root,
-        Err(error) => {
-            return Ok(ProjectRestoreResponse::unavailable(
-                requested_root.to_string_lossy().replace('\\', "/"),
-                error.to_string(),
-            ));
-        }
-    };
-    let session_snapshot = state.project_store.load_session_or_default(&root);
-    switch_project(root, Some(session_snapshot), app, &state)
-        .await
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn project_save_session(
-    snapshot: ProjectSessionSnapshot,
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let root = state.project_root.read().await.clone();
-    state
-        .project_store
-        .save_session(&root, &snapshot)
-        .map_err(display_error)?;
-    Ok(json!({"status": "saved"}))
-}
-
-#[tauri::command]
-async fn project_read_file(path: String, state: State<'_, AppState>) -> Result<Value, String> {
-    let root = state.project_root.read().await.clone();
-    let file = project_path(&root, &path).map_err(display_error)?;
-    let content = std::fs::read_to_string(&file).map_err(display_error)?;
-    Ok(json!({"path": path, "content": content}))
-}
-
-#[tauri::command]
-async fn project_write_file(
-    path: String,
-    content: String,
-    state: State<'_, AppState>,
-) -> Result<ProjectState, String> {
-    let root = state.project_root.read().await.clone();
-    let file = project_path(&root, &path).map_err(display_error)?;
-    ensure_editable_file(&file).map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(display_error)?;
-    }
-    std::fs::write(file, content).map_err(display_error)?;
-    context.broker.project_changed();
-    let identity = context.broker.identity().clone();
-    context
-        .store
-        .save_identity(&identity)
-        .map_err(display_error)?;
-    drop(context);
-    project_state(state).await
-}
-
-#[tauri::command]
-async fn project_create_file(
-    path: String,
-    content: String,
-    state: State<'_, AppState>,
-) -> Result<ProjectState, String> {
-    let root = state.project_root.read().await.clone();
-    let file = project_path(&root, &path).map_err(display_error)?;
-    ensure_editable_file(&file).map_err(display_error)?;
-    if file.exists() {
-        return Err(format!("Project file already exists: {path}"));
-    }
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(display_error)?;
-    }
-    std::fs::write(file, content).map_err(display_error)?;
-    context.broker.project_changed();
-    let identity = context.broker.identity().clone();
-    context
-        .store
-        .save_identity(&identity)
-        .map_err(display_error)?;
-    drop(context);
-    project_state(state).await
-}
-
-#[tauri::command]
-async fn execute_r(request: ExecuteRequest, state: State<'_, AppState>) -> Result<Value, String> {
-    if request.code.trim().is_empty() {
-        return Err("R code is empty".to_string());
-    }
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": {
-            "code": request.code,
-            "source_path": request.source_path,
-            "execution_mode": request.execution_mode,
-            "document_version": request.document_version
-        },
-        "expected_workspace": broker.identity()
+fn main() {
+    let launch = launch_options(env::args_os().skip(1)).unwrap_or_else(|error| {
+        eprintln!("rho-desktop: {error:#}");
+        std::process::exit(2);
     });
-    dispatch_workspace_request(
-        "workspace.execute",
-        &payload,
-        ExecutionOrigin::User,
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await
-    .map_err(display_error)
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .setup(move |app| Ok(setup(app, &launch)?))
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running the Rho desktop wrapper");
 }
 
-#[tauri::command]
-async fn snapshot_workspace(state: State<'_, AppState>) -> Result<Value, String> {
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": {},
-        "expected_workspace": broker.identity()
-    });
-    dispatch_workspace_request(
-        "workspace.snapshot",
-        &payload,
-        ExecutionOrigin::System,
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await
-    .map_err(display_error)
-}
-
-#[tauri::command]
-async fn inspect_object(
-    request: InspectObjectRequest,
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": {
-            "name": request.name
-        },
-        "expected_workspace": broker.identity()
-    });
-    dispatch_workspace_request(
-        "workspace.inspect_object",
-        &payload,
-        ExecutionOrigin::System,
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await
-    .map_err(display_error)
-}
-
-#[tauri::command]
-async fn render_document(
-    request: RenderRequest,
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let root = state.project_root.read().await.clone();
-    let source_path = request.path.clone();
-    let file = project_path(&root, &source_path).map_err(display_error)?;
-    let extension = file
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "rmd" | "qmd") {
-        return Err("Render only supports project .Rmd and .qmd files".to_string());
-    }
-    if !file.is_file() {
-        return Err(format!("Render source does not exist: {source_path}"));
-    }
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": {
-            "path": file.to_string_lossy(),
-            "format": request.format,
-            "source_path": source_path,
-            "execution_mode": "render",
-            "document_version": request.document_version
-        },
-        "expected_workspace": broker.identity()
-    });
-    dispatch_workspace_request(
-        "workspace.render_document",
-        &payload,
-        ExecutionOrigin::User,
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await
-    .map_err(display_error)
-}
-
-#[tauri::command]
-async fn list_runs(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<RunSummary>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .list_runs(limit)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn list_problems(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<ProblemSummary>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .list_problems(limit)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn get_run_detail(
-    run_id: String,
-    state: State<'_, AppState>,
-) -> Result<Option<RunDetail>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .get_run_detail(&run_id)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn list_plot_artifacts(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<PlotArtifactSummary>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .list_plot_artifacts(limit)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn retry_run(run_id: String, state: State<'_, AppState>) -> Result<Value, String> {
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let mut context = context.lock().await;
-    let detail = context
-        .store
-        .get_run_detail(&run_id)
-        .map_err(display_error)?
-        .context(format!("Run not found: {run_id}"))
-        .map_err(display_error)?;
-    let mut arguments: Value =
-        serde_json::from_str(&detail.arguments_json).map_err(display_error)?;
-    let object = arguments
-        .as_object_mut()
-        .context("Stored run arguments are invalid")
-        .map_err(display_error)?;
-    object.insert(
-        "parent_run_id".to_string(),
-        Value::String(detail.run_id.clone()),
-    );
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": arguments,
-        "expected_workspace": broker.identity()
-    });
-    dispatch_workspace_request(
-        &detail.request_type,
-        &payload,
-        parse_execution_origin(&detail.origin),
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await
-    .map_err(display_error)
-}
-
-#[tauri::command]
-async fn run_agent(
-    prompt: String,
-    mode: String,
-    model: Option<String>,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
-    if prompt.trim().is_empty() {
-        return Err("Agent prompt is empty".to_string());
-    }
-    if !matches!(mode.as_str(), "ask" | "plan" | "act") {
-        return Err(format!("unsupported Agent mode `{mode}`"));
-    }
-    let session = active_session(&state).await.map_err(display_error)?;
-    let context = active_context(&state).await.map_err(display_error)?;
-    let turn_id = format!("agent_turn_{}", Uuid::new_v4());
-    let model = model.unwrap_or_else(|| "deepseek:deepseek-v4-flash".to_string());
-    {
-        let mut context_guard = context.lock().await;
-        let identity = context_guard.broker.identity().clone();
-        context_guard
-            .store
-            .create_agent_turn(&AgentTurnDraft {
-                turn_id: turn_id.clone(),
-                mode: mode.clone(),
-                prompt: prompt.clone(),
-                model: model.clone(),
-                workspace_id: identity.workspace_id.clone(),
-                state_revision_before: identity.state_revision as i64,
-                project_revision_before: identity.project_revision as i64,
-            })
-            .map_err(display_error)?;
-        context_guard
-            .store
-            .append_agent_turn_event(&AgentTurnEventDraft {
-                turn_id: turn_id.clone(),
-                event_type: "agent.user_prompt".to_string(),
-                title: "You".to_string(),
-                body: Some(prompt.clone()),
-                status: "completed".to_string(),
-                tool: None,
-                request_id: None,
-                code: None,
-                details_json: serde_json::to_string(&json!({"prompt": prompt, "mode": mode}))
-                    .map_err(display_error)?,
-            })
-            .map_err(display_error)?;
-    }
-
-    let approvals = state.approvals.clone();
-    let rscript = state.config.rscript.clone();
-    let agent_package = state.config.agent_package.clone();
-    let task_turn_id = turn_id.clone();
-    let agent_tasks = state.agent_tasks.clone();
-    let task_agent_tasks = agent_tasks.clone();
-    let (registered_tx, registered_rx) = oneshot::channel();
-    let task = tauri::async_runtime::spawn(async move {
-        let _ = registered_rx.await;
-        let _ = run_agent_turn(
-            session.as_ref(),
-            context,
-            rscript,
-            agent_package,
-            model,
-            prompt,
-            mode,
-            task_turn_id.clone(),
-            approvals,
-        )
-        .await;
-        let _ = app.emit(
-            "rho://agent-turn-updated",
-            json!({ "turn_id": task_turn_id.clone() }),
-        );
-        task_agent_tasks.lock().await.remove(&task_turn_id);
-    });
-    let mut tasks = agent_tasks.lock().await;
-    tasks.insert(turn_id.clone(), task);
-    drop(tasks);
-    let _ = registered_tx.send(());
-    Ok(json!({
-        "status": "started",
-        "turn_id": turn_id
-    }))
-}
-
-#[derive(Deserialize)]
-struct ApprovalDecisionRequest {
-    request_id: String,
-    decision: String,
-    reason: Option<String>,
-}
-
-#[tauri::command]
-async fn list_agent_turns(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<AgentTurnSummary>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .list_agent_turns(limit)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn list_approval_requests(
-    limit: Option<usize>,
-    status: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<Vec<ApprovalRequestSummary>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .list_approval_requests(limit, status.as_deref())
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn get_agent_turn_detail(
-    turn_id: String,
-    state: State<'_, AppState>,
-) -> Result<Option<AgentTurnDetail>, String> {
-    read_store(&state)
-        .map_err(display_error)?
-        .get_agent_turn_detail(&turn_id)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn respond_approval(
-    request: ApprovalDecisionRequest,
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
-    if !matches!(request.decision.as_str(), "approve" | "reject" | "cancel") {
-        return Err(format!(
-            "unsupported approval decision `{}`",
-            request.decision
-        ));
-    }
-    let pending = read_store(&state)
-        .map_err(display_error)?
-        .get_approval_request(&request.request_id)
-        .map_err(display_error)?
-        .filter(|item| item.status == "waiting")
-        .context(format!(
-            "Approval request not found or no longer waiting: {}",
-            request.request_id
-        ))
-        .map_err(display_error)?;
-    let delivered = state
-        .approvals
-        .respond(
-            &request.request_id,
-            ApprovalResponseInput {
-                decision: request.decision.clone(),
-                reason: request.reason.clone(),
-            },
-        )
-        .await;
-    if !delivered {
-        read_store(&state)
-            .map_err(display_error)?
-            .resolve_approval_request(
-                &request.request_id,
-                &rho_store::ApprovalDecisionRecord {
-                    decision: "cancel".to_string(),
-                    status: "interrupted".to_string(),
-                    reason: Some("Approval channel is no longer active.".to_string()),
-                    continuation_outcome: Some("agent_unavailable".to_string()),
-                },
-            )
-            .map_err(display_error)?;
-    }
-    Ok(json!({
-        "status": if delivered { "delivered" } else { "not_delivered" },
-        "request_id": request.request_id,
-        "turn_id": pending.turn_id
-    }))
-}
-
-#[tauri::command]
-async fn interrupt_r(state: State<'_, AppState>) -> Result<Value, String> {
-    request_run_interrupt(None, &state)
-        .await
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn cancel_run(run_id: String, state: State<'_, AppState>) -> Result<Value, String> {
-    request_run_interrupt(Some(run_id), &state)
-        .await
-        .map_err(display_error)
-}
-
-#[tauri::command]
-async fn restart_workspace(state: State<'_, AppState>) -> Result<WorkspaceStatus, String> {
-    state
-        .approvals
-        .cancel_all("Workspace R is restarting.")
-        .await;
-    let tasks = {
-        let mut tasks = state.agent_tasks.lock().await;
-        tasks.drain().map(|(_, task)| task).collect::<Vec<_>>()
-    };
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
-
-    let old_context = state.context.lock().await.take();
-    let old_session = state.session.write().await.take();
-    if let Some(session) = old_session.as_ref() {
-        let mut store = read_store(&state).map_err(display_error)?;
-        if let Some(run_id) = store.latest_active_run_id().map_err(display_error)? {
-            store.request_cancel(&run_id).map_err(display_error)?;
-            drop(store);
-            session.interrupt().await.map_err(display_error)?;
-        }
-    }
-    if let Some(context) = old_context.as_ref() {
-        let guard = tokio::time::timeout(std::time::Duration::from_secs(15), context.lock())
-            .await
-            .map_err(|_| {
-                "Timed out waiting for the previous Workspace R run to stop".to_string()
-            })?;
-        drop(guard);
-    }
-    drop(old_session);
-    drop(old_context);
-    let status = start_workspace(&state).await.map_err(display_error)?;
-    let root = state.project_root.read().await.clone();
-    sync_workspace_project_root(&state, &root)
-        .await
-        .map_err(display_error)?;
-    Ok(status)
-}
-
-async fn active_session(state: &AppState) -> Result<Arc<ArkSession>> {
-    state
-        .session
-        .read()
-        .await
+fn setup(app: &mut tauri::App, launch: &LaunchOptions) -> Result<()> {
+    let project_root = launch
+        .project_root
         .clone()
-        .context("Workspace R is not running")
-}
-
-async fn active_context(state: &AppState) -> Result<Arc<Mutex<CoordinatorRuntime>>> {
-    state
-        .context
-        .lock()
-        .await
-        .clone()
-        .context("Workspace context is not ready")
-}
-
-fn read_store(state: &AppState) -> Result<Store> {
-    Store::open(&state.config.store_path).context("opening Rho event store")
-}
-
-async fn start_workspace(state: &AppState) -> Result<WorkspaceStatus> {
-    if let Some(session) = state.session.read().await.clone() {
-        let context = state.context.lock().await.clone();
-        let identity = if let Some(context) = context {
-            let context = context.lock().await;
-            Some(context.broker.identity().clone())
-        } else {
-            None
-        };
-        return status_from(&state.config, &session, identity.as_ref());
-    }
-
-    let session = Arc::new(
-        ArkSession::launch(&ArkLaunchConfig::new(&state.config.kernelspec))
-            .await
-            .context("starting Ark-backed Workspace R")?,
-    );
-    let mut store = Store::open(&state.config.store_path).context("opening Rho event store")?;
-    store
-        .recover_incomplete_runs()
-        .context("recovering incomplete runs after desktop restart")?;
-    store
-        .recover_incomplete_agent_turns()
-        .context("recovering incomplete agent turns after desktop restart")?;
-    store
-        .recover_incomplete_approvals()
-        .context("recovering incomplete approvals after desktop restart")?;
-    let mut broker = BrokerState::new(format!("desktop_{}", Uuid::new_v4()));
-    store.save_identity(broker.identity())?;
-    bootstrap_bridge(
-        session.as_ref(),
-        &mut broker,
-        &mut store,
-        &state.config.bridge_package,
-    )
-    .await?;
-    let status = status_from(&state.config, &session, Some(broker.identity()))?;
-    *state.context.lock().await = Some(Arc::new(Mutex::new(CoordinatorRuntime { broker, store })));
-    *state.session.write().await = Some(session);
-    Ok(status)
-}
-
-async fn request_run_interrupt(run_id: Option<String>, state: &AppState) -> Result<Value> {
-    let session = active_session(state).await?;
-    let mut store = read_store(state)?;
-    let target = match run_id {
-        Some(value) => value,
-        None => store
-            .latest_active_run_id()
-            .context("looking up active run")?
-            .context("No active run is available to interrupt")?,
-    };
+        .unwrap_or(env::current_dir().context("resolving current project directory")?)
+        .canonicalize()
+        .context("resolving Rho project root")?;
     ensure!(
-        store
-            .request_cancel(&target)
-            .context("marking run as cancel-requested")?,
-        "Run is not active: {target}"
+        project_root.is_dir(),
+        "Rho project root must be a directory"
     );
-    drop(store);
-    session
-        .interrupt()
-        .await
-        .context("interrupting Workspace R")?;
-    Ok(json!({
-        "status": "interrupt_requested",
-        "run_id": target
-    }))
-}
 
-fn parse_execution_origin(origin: &str) -> ExecutionOrigin {
-    match origin {
-        "agent" => ExecutionOrigin::Agent,
-        "system" => ExecutionOrigin::System,
-        _ => ExecutionOrigin::User,
-    }
-}
+    let store_path = project_root.join(".rho/state/runtime.sqlite");
+    let runtime = RuntimeService::open(
+        RuntimeServiceConfig::new(store_path).with_project_root(project_root.clone()),
+    )?;
+    let listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+    )))?;
+    let address = listener.local_addr()?;
+    let runtime_url = format!("http://{address}");
 
-async fn switch_project(
-    root: PathBuf,
-    session_snapshot: Option<ProjectSessionSnapshot>,
-    app: AppHandle,
-    state: &AppState,
-) -> Result<ProjectRestoreResponse> {
-    sync_workspace_project_root(state, &root).await?;
-    state.project_store.save_last_opened_project(&root)?;
-    let session_snapshot =
-        session_snapshot.unwrap_or_else(|| state.project_store.load_session_or_default(&root));
-    *state.project_root.write().await = root.clone();
-    let mut watcher = state.project_watcher.lock().await;
-    replace_project_watcher(&mut watcher, app, root.clone())?;
-    let project = list_project_files(&root)?;
-    Ok(ProjectRestoreResponse::ready(project, session_snapshot))
-}
-
-async fn sync_workspace_project_root(state: &AppState, root: &Path) -> Result<()> {
-    let session = active_session(state).await?;
-    let context = active_context(state).await?;
-    let mut context = context.lock().await;
-    let CoordinatorRuntime { broker, store } = &mut *context;
-    let payload = json!({
-        "arguments": {"code": format!("setwd({})", serde_json::to_string(&root.to_string_lossy()).unwrap())},
-        "expected_workspace": broker.identity()
+    let server_runtime = runtime.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = rho_server::api::serve(listener, server_runtime).await {
+            eprintln!("rho-desktop server stopped: {error:#}");
+        }
     });
-    dispatch_workspace_request(
-        "workspace.set_project_root",
-        &payload,
-        ExecutionOrigin::System,
-        session.as_ref(),
-        broker,
-        store,
-    )
-    .await?;
+
+    if let Some(kernelspec) = launch.kernelspec.clone() {
+        let bridge_package = resolve_bridge_package(app, launch.bridge_package.as_deref())?;
+        let runtime = runtime.clone();
+        let app_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let message = match runtime.start_ark(kernelspec, bridge_package).await {
+                Ok(_) => "Workspace R is connected.".to_string(),
+                Err(error) => {
+                    eprintln!("rho-desktop could not attach Workspace R: {error:#}");
+                    format!("The control plane started, but Workspace R could not connect: {error}")
+                }
+            };
+            let _ = app_handle
+                .notification()
+                .builder()
+                .title("Rho")
+                .body(message)
+                .show();
+        });
+    }
+
+    build_window(app, address, &runtime_url)?;
+    build_tray(app)?;
+    let _ = app
+        .notification()
+        .builder()
+        .title("Rho runtime started")
+        .body(format!("Scientific workspace: {}", project_root.display()))
+        .show();
     Ok(())
 }
 
-fn status_from(
-    config: &RuntimeConfig,
-    session: &ArkSession,
-    identity: Option<&rho_protocol::WorkspaceIdentity>,
-) -> Result<WorkspaceStatus> {
-    let metadata = std::fs::read_to_string(config.kernelspec.with_extension("runtime.json"))?;
-    let metadata: Value = serde_json::from_str(&metadata)?;
-    Ok(WorkspaceStatus {
-        status: "idle",
-        r_version: metadata["r_version"].as_str().unwrap_or("R").to_string(),
-        r_home: metadata["r_home"].as_str().unwrap_or_default().to_string(),
-        kernel_pid: session.child_pid(),
-        workspace: identity.map(|value| serde_json::to_value(value).unwrap_or(Value::Null)),
-        python_required: false,
-    })
+fn build_window(app: &tauri::App, address: SocketAddr, runtime_url: &str) -> Result<()> {
+    let url = runtime_url.parse().context("parsing local runtime URL")?;
+    WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+        .title("Rho · Scientific Runtime")
+        .inner_size(1280.0, 820.0)
+        .min_inner_size(900.0, 620.0)
+        .center()
+        .on_navigation(move |url| navigation_is_local_runtime(url, address))
+        .build()?;
+    Ok(())
 }
 
-fn prepare_runtime(app: &tauri::App) -> Result<RuntimeConfig> {
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .context("resolving Rho application data directory")?;
-    prepare_runtime_files(data_dir, locate_ark(app)?)
+fn build_tray(app: &tauri::App) -> Result<()> {
+    let open = MenuItem::with_id(app, "open", "Open Rho", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Rho", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("rho")
+        .tooltip("Rho scientific runtime")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }
 
-fn prepare_runtime_files(data_dir: PathBuf, ark: PathBuf) -> Result<RuntimeConfig> {
-    std::fs::create_dir_all(&data_dir)?;
-    let source_dir = data_dir.join("sources");
-    let bridge_package = source_dir.join("rho.bridge");
-    let agent_package = source_dir.join("rho.agent");
-    write_source(&bridge_package.join("R/state.R"), BRIDGE_STATE)?;
-    write_source(&bridge_package.join("R/execute.R"), BRIDGE_EXECUTE)?;
-    write_source(&bridge_package.join("R/workspace.R"), BRIDGE_WORKSPACE)?;
-    write_source(&agent_package.join("R/aaa-state.R"), AGENT_STATE)?;
-    write_source(&agent_package.join("R/transport.R"), AGENT_TRANSPORT)?;
-    write_source(&agent_package.join("R/aisdk_adapter.R"), AGENT_ADAPTER)?;
-
-    let rscript = locate_rscript()?;
-    let r_home = r_output(&rscript, "cat(normalizePath(R.home(), winslash = '/'))")?;
-    let r_version = r_output(&rscript, "cat(R.version.string)")?;
-    let r_libs = r_output(
-        &rscript,
-        "cat(paste(normalizePath(.libPaths(), winslash = '/', mustWork = FALSE), collapse = ';'))",
-    )?;
-    let runtime_dir = data_dir.join("runtime");
-    std::fs::create_dir_all(&runtime_dir)?;
-    let empty_renviron = runtime_dir.join("empty.Renviron");
-    write_source(&empty_renviron, "")?;
-    let log_path = runtime_dir.join("ark.log");
-    let kernelspec = runtime_dir.join("kernel.json");
-    let r_bin = Path::new(&r_home).join("bin").join("x64");
-    let path = format!(
-        "{};{}",
-        r_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let spec = json!({
-        "argv": [ark, "--connection_file", "{connection_file}", "--session-mode", "console", "--log", log_path, "--", "--interactive", "--no-environ", "--no-init-file", "--no-site-file"],
-        "display_name": "Ark R 0.1.252 (Rho Desktop)",
-        "language": "R",
-        "interrupt_mode": "message",
-        "kernel_protocol_version": "5.4",
-        "env": {
-            "R_HOME": r_home,
-            "R_LIBS": r_libs,
-            "R_ENVIRON_USER": empty_renviron,
-            "PATH": path
-        }
-    });
-    std::fs::write(&kernelspec, serde_json::to_vec_pretty(&spec)?)?;
-    std::fs::write(
-        kernelspec.with_extension("runtime.json"),
-        serde_json::to_vec_pretty(&json!({"r_version": r_version, "r_home": r_home}))?,
-    )?;
-    Ok(RuntimeConfig {
-        data_dir: data_dir.clone(),
-        kernelspec,
-        rscript,
-        bridge_package,
-        agent_package,
-        store_path: data_dir.join("rho-desktop.sqlite"),
-    })
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
-fn locate_ark(app: &tauri::App) -> Result<PathBuf> {
-    let development = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/runtime/ark.exe");
+fn resolve_bridge_package(app: &tauri::App, explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return canonical_directory(path, "Rho bridge package");
+    }
+    if let Some(path) = env::var_os("RHO_BRIDGE_PACKAGE") {
+        return canonical_directory(&PathBuf::from(path), "RHO_BRIDGE_PACKAGE");
+    }
     let installed = app
         .path()
         .resource_dir()
         .context("resolving Rho resource directory")?
-        .join("resources/runtime/ark.exe");
+        .join("resources/rho.bridge");
+    let development = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../r/rho.bridge");
     [installed, development]
         .into_iter()
-        .find(|path| path.is_file())
-        .context("bundled Ark executable was not found")
+        .find(|path| path.is_dir())
+        .context("rho.bridge was not found; set RHO_BRIDGE_PACKAGE")
 }
 
-fn locate_rscript() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("RHO_RSCRIPT") {
-        let path = PathBuf::from(path);
-        ensure!(path.is_file(), "RHO_RSCRIPT does not point to a file");
-        return Ok(path);
+fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {label} at {}", path.display()))?;
+    ensure!(path.is_dir(), "{label} must be a directory");
+    Ok(path)
+}
+
+fn navigation_is_local_runtime(url: &tauri::Url, address: SocketAddr) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port_or_known_default() == Some(address.port())
+}
+
+fn launch_options(arguments: impl IntoIterator<Item = OsString>) -> Result<LaunchOptions> {
+    let mut options = LaunchOptions::default();
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--project-root" => {
+                options.project_root = Some(required_path(&mut arguments, "--project-root")?);
+            }
+            "--kernelspec" => {
+                options.kernelspec = Some(required_path(&mut arguments, "--kernelspec")?);
+            }
+            "--bridge-package" => {
+                options.bridge_package = Some(required_path(&mut arguments, "--bridge-package")?);
+            }
+            value if value.starts_with('-') => {}
+            _ if options.project_root.is_none() => {
+                let path = PathBuf::from(argument);
+                if path.is_dir() {
+                    options.project_root = Some(path);
+                } else if path.is_file() {
+                    options.project_root = path.parent().map(Path::to_path_buf);
+                }
+            }
+            _ => {}
+        }
     }
-    let output = Command::new("where.exe")
-        .arg("Rscript.exe")
-        .output()
-        .context("searching for Rscript.exe")?;
-    if output.status.success() {
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .context("where.exe returned no Rscript path");
+    if options.project_root.is_none() {
+        options.project_root = env::var_os("RHO_PROJECT_ROOT").map(PathBuf::from);
     }
-    let program_files = std::env::var_os("ProgramFiles")
+    if options.kernelspec.is_none() {
+        options.kernelspec = env::var_os("RHO_KERNELSPEC").map(PathBuf::from);
+    }
+    Ok(options)
+}
+
+fn required_path(arguments: &mut impl Iterator<Item = OsString>, option: &str) -> Result<PathBuf> {
+    arguments
+        .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    if let Ok(entries) = std::fs::read_dir(program_files.join("R")) {
-        let mut candidates = entries
-            .flatten()
-            .map(|entry| entry.path().join("bin/Rscript.exe"))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        if let Some(path) = candidates.pop() {
-            return Ok(path);
-        }
+        .with_context(|| format!("{option} requires a path"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn file_association_uses_the_containing_project() {
+        let directory = TempDir::new().unwrap();
+        let project = directory.path().join("analysis.Rproj");
+        std::fs::write(&project, "Version: 1.0\n").unwrap();
+        let options = launch_options([project.into_os_string()]).unwrap();
+        assert_eq!(options.project_root.as_deref(), Some(directory.path()));
     }
-    bail!("Rscript.exe was not found. Install R 4.4 or later, then restart Rho.")
-}
 
-fn r_output(rscript: &Path, expression: &str) -> Result<String> {
-    let output = Command::new(rscript)
-        .args(["--vanilla", "-e", expression])
-        .output()
-        .with_context(|| format!("running {}", rscript.display()))?;
-    ensure!(
-        output.status.success(),
-        "R runtime probe failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn write_source(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content)?;
-    Ok(())
-}
-
-fn display_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
-fn startup_log_path() -> PathBuf {
-    std::env::temp_dir().join("rho-desktop-startup.log")
-}
-
-fn write_startup_log(message: &str) {
-    let _ = std::fs::write(startup_log_path(), message);
-}
-
-async fn smoke_test(include_agent: bool) -> Result<Value> {
-    let data_dir = std::env::temp_dir().join("rho-desktop-smoke");
-    let ark = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/runtime/ark.exe");
-    let config = prepare_runtime_files(data_dir, ark)?;
-    let session = ArkSession::launch(&ArkLaunchConfig::new(&config.kernelspec)).await?;
-    let mut store = Store::open(&config.store_path)?;
-    let mut broker = BrokerState::new("desktop_smoke");
-    store.save_identity(broker.identity())?;
-    bootstrap_bridge(&session, &mut broker, &mut store, &config.bridge_package).await?;
-    let execute_payload = json!({
-        "arguments": {
-            "code": "rho_desktop_smoke <- data.frame(x = 1:5, y = (1:5)^2); plot(rho_desktop_smoke$x, rho_desktop_smoke$y, pch = 19)"
-        },
-        "expected_workspace": broker.identity()
-    });
-    let execution = dispatch_workspace_request(
-        "workspace.execute",
-        &execute_payload,
-        ExecutionOrigin::User,
-        &session,
-        &mut broker,
-        &mut store,
-    )
-    .await?;
-    let snapshot_payload = json!({
-        "arguments": {},
-        "expected_workspace": broker.identity()
-    });
-    let snapshot = dispatch_workspace_request(
-        "workspace.snapshot",
-        &snapshot_payload,
-        ExecutionOrigin::System,
-        &session,
-        &mut broker,
-        &mut store,
-    )
-    .await?;
-    let plot_count = execution["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|event| event["type"] == "display_data")
-        .count();
-    let object_found = snapshot["execution"]["objects"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|object| object["name"] == "rho_desktop_smoke");
-    ensure!(plot_count > 0, "desktop smoke test did not receive a plot");
-    ensure!(
-        object_found,
-        "desktop smoke object was absent from Environment"
-    );
-    let context = Arc::new(Mutex::new(CoordinatorRuntime { broker, store }));
-    let agent = if include_agent {
-        let result = run_agent_turn(
-            &session,
-            context.clone(),
-            config.rscript.clone(),
-            config.agent_package.clone(),
-            "deepseek:deepseek-v4-flash".to_string(),
-            "请检查 rho_desktop_smoke 对象，告诉我它有多少行和多少列。不要修改工作区。".to_string(),
-            "ask".to_string(),
-            "smoke_turn".to_string(),
-            Arc::new(PendingApprovalRegistry::default()),
-        )
-        .await?;
-        let completed = result["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|event| event["type"] == "chat.message_completed");
-        ensure!(completed, "desktop Agent turn omitted its final message");
-        Some(json!({"completed": true, "model": result["model"]}))
-    } else {
-        None
-    };
-    let context = context.lock().await;
-    Ok(json!({
-        "type": "rho_desktop_smoke",
-        "workspace": context.broker.identity(),
-        "plot_count": plot_count,
-        "environment_object_found": object_found,
-        "agent": agent,
-        "event_count": context.store.event_count()?,
-        "python_required": false
-    }))
-}
-
-fn main() {
-    let _ = std::fs::remove_file(startup_log_path());
-    std::panic::set_hook(Box::new(|information| {
-        write_startup_log(&format!("Rho desktop panic: {information}"));
-    }));
-    let arguments = std::env::args().collect::<Vec<_>>();
-    let smoke_agent = arguments.iter().any(|argument| argument == "--smoke-agent");
-    if smoke_agent || arguments.iter().any(|argument| argument == "--smoke-test") {
-        let runtime = tokio::runtime::Runtime::new().expect("creating smoke-test runtime");
-        match runtime.block_on(smoke_test(smoke_agent)) {
-            Ok(report) => {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                return;
-            }
-            Err(error) => {
-                eprintln!("Rho desktop smoke test failed: {error:#}");
-                std::process::exit(1);
-            }
-        }
-    }
-    tauri::Builder::default()
-        .setup(|app| {
-            let config = prepare_runtime(app).map_err(|error| {
-                write_startup_log(&format!("Rho desktop setup failed: {error:#}"));
-                error
-            })?;
-            let project_store =
-                ProjectSessionStore::new(config.data_dir.clone()).map_err(|error| {
-                    write_startup_log(&format!("Rho project session setup failed: {error:#}"));
-                    error
-                })?;
-            app.manage(AppState {
-                config,
-                project_store,
-                project_root: RwLock::new(default_project_root()),
-                project_watcher: Mutex::new(None),
-                session: RwLock::new(None),
-                context: Mutex::new(None),
-                approvals: Arc::new(PendingApprovalRegistry::default()),
-                agent_tasks: Arc::new(Mutex::new(HashMap::new())),
-            });
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            workspace_start,
-            workspace_status,
-            project_state,
-            project_open,
-            project_pick_directory,
-            project_restore_session,
-            project_save_session,
-            project_read_file,
-            project_write_file,
-            project_create_file,
-            execute_r,
-            snapshot_workspace,
-            inspect_object,
-            render_document,
-            list_runs,
-            list_plot_artifacts,
-            list_problems,
-            get_run_detail,
-            retry_run,
-            run_agent,
-            list_agent_turns,
-            list_approval_requests,
-            get_agent_turn_detail,
-            respond_approval,
-            interrupt_r,
-            cancel_run,
-            restart_workspace
+    #[test]
+    fn explicit_launch_options_are_parsed_without_interpreting_platform_flags() {
+        let options = launch_options([
+            OsString::from("-psn_0_123"),
+            OsString::from("--project-root"),
+            OsString::from("/tmp/project"),
+            OsString::from("--kernelspec"),
+            OsString::from("/tmp/kernel.json"),
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Rho desktop");
+        .unwrap();
+        assert_eq!(options.project_root, Some(PathBuf::from("/tmp/project")));
+        assert_eq!(options.kernelspec, Some(PathBuf::from("/tmp/kernel.json")));
+    }
+
+    #[test]
+    fn navigation_is_limited_to_the_embedded_local_server() {
+        let address: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        assert!(navigation_is_local_runtime(
+            &"http://127.0.0.1:8787/runs".parse().unwrap(),
+            address
+        ));
+        assert!(!navigation_is_local_runtime(
+            &"http://127.0.0.1:9999/".parse().unwrap(),
+            address
+        ));
+        assert!(!navigation_is_local_runtime(
+            &"https://example.com/".parse().unwrap(),
+            address
+        ));
+    }
 }

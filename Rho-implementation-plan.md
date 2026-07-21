@@ -1,5 +1,10 @@
 # Rho: Agent-native R Scientific Workbench
 
+> Historical note (2026-07-20): this desktop-first implementation plan is
+> retained as design history. ADR-010 and the current development roadmap
+> supersede its product boundary: `rho-server` is the product, while browser,
+> CLI, MCP, and desktop are projections.
+
 > Status: reviewed architecture baseline  
 > Date: 2026-07-15  
 > Project root: `D:\Rho`  

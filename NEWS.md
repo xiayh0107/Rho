@@ -6,7 +6,25 @@ this file records behavior that is already available in a released build.
 
 ## Unreleased
 
-No unreleased user-visible changes.
+### Changed
+
+- Repositioned Rho as an Agent-native scientific runtime for R: Agent clients
+  reason and plan while Rho executes and proves.
+- Made `rho-server` the durable source of workspace truth and reduced desktop
+  to a browser wrapper with tray, notifications, startup, and `.Rproj`
+  association.
+
+### Added
+
+- Independently versioned Workbench Protocol entities, HTTP API, JSON schemas,
+  replayable WebSocket events, artifact references, and deep links.
+- Machine-readable `rho` CLI and semantic `rho-mcp` server.
+- Browser pages for Runs, Objects, Plots, Problems, Approvals, and Provenance.
+- Bounded semantic inspection for data frames, Seurat,
+  SummarizedExperiment, SingleCellExperiment, GRanges, and ggplot objects.
+- Unified action policy, provenance graph, and remote HTTP/WebSocket gateway.
+- Project-scoped Codex and Claude Code integrations, a Claude plugin, Agent
+  skills, R project detection, and `rho init` bootstrap commands.
 
 ## 0.2.0-dev.2 - 2026-07-16
 
