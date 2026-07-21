@@ -82,7 +82,7 @@ test_that("tabular previews bound nested and long cell payloads by bytes", {
   workspace$x <- data.frame(id = 1L)
   workspace$x$payload <- I(list(strrep("x", 1000000L)))
   result <- rho_inspect_object("x", envir = workspace)
-  encoded <- jsonlite::toJSON(result, auto_unbox = TRUE, null = "null")
+  encoded <- rho.bridge:::rho_json_encode(result)
 
   expect_lt(nchar(encoded, type = "bytes"), 50000L)
   expect_match(result$preview$rows[[1L]]$payload, "truncated|length")
@@ -92,10 +92,70 @@ test_that("list previews bound long item names", {
   workspace <- new.env(parent = baseenv())
   workspace$x <- setNames(list(1L), strrep("x", 1000000L))
   result <- rho_inspect_object("x", envir = workspace)
-  encoded <- jsonlite::toJSON(result, auto_unbox = TRUE, null = "null")
+  encoded <- rho.bridge:::rho_json_encode(result)
 
   expect_lt(nchar(encoded, type = "bytes"), 50000L)
   expect_match(result$preview$items[[1L]], "truncated")
+})
+
+test_that("base R JSON encoding covers bridge scalar and vector values", {
+  expect_identical(rho.bridge:::rho_json_encode(NULL), "null")
+  expect_identical(rho.bridge:::rho_json_encode(TRUE), "true")
+  expect_identical(rho.bridge:::rho_json_encode(c(TRUE, FALSE, NA)), "[true,false,null]")
+  expect_identical(rho.bridge:::rho_json_encode(42L), "42")
+  expect_identical(rho.bridge:::rho_json_encode(c(1L, NA_integer_)), "[1,null]")
+  expect_identical(rho.bridge:::rho_json_encode(1.25), "1.25")
+  expect_identical(
+    rho.bridge:::rho_json_encode(c(NA_real_, NaN, Inf, -Inf)),
+    "[null,null,null,null]"
+  )
+  expect_identical(rho.bridge:::rho_json_encode(character()), "[]")
+  expect_identical(
+    rho.bridge:::rho_json_encode(c("alpha", NA_character_, "omega")),
+    '["alpha",null,"omega"]'
+  )
+})
+
+test_that("base R JSON encoding escapes strings and preserves UTF-8", {
+  expect_identical(
+    rho.bridge:::rho_json_encode("\b\f\n\r\t\"\\"),
+    '"\\b\\f\\n\\r\\t\\\"\\\\"'
+  )
+  expect_identical(rho.bridge:::rho_json_encode("\u0001"), '"\\u0001"')
+  expect_identical(
+    enc2utf8(rho.bridge:::rho_json_encode("雪😀")),
+    enc2utf8('"雪😀"')
+  )
+})
+
+test_that("base R JSON encoding distinguishes named and unnamed lists", {
+  expect_identical(
+    rho.bridge:::rho_json_encode(list(TRUE, c("x", "y"), NULL)),
+    '[true,["x","y"],null]'
+  )
+  expect_identical(
+    rho.bridge:::rho_json_encode(list(ok = TRUE, nested = list(value = 2L))),
+    '{"ok":true,"nested":{"value":2}}'
+  )
+  expect_identical(rho.bridge:::rho_json_encode(setNames(list(), character())), "{}")
+})
+
+test_that("base R JSON encoding rejects unbounded or ambiguous object graphs", {
+  expect_error(
+    rho.bridge:::rho_json_encode(structure(list(value = 1L), class = "custom")),
+    "classed object"
+  )
+  expect_error(rho.bridge:::rho_json_encode(globalenv()), "R type <environment>")
+  expect_error(rho.bridge:::rho_json_encode(list(a = 1L, 2L)), "non-empty")
+  expect_error(rho.bridge:::rho_json_encode(list(a = 1L, a = 2L)), "unique")
+
+  nested <- 1L
+  for (index in seq_len(4L)) {
+    nested <- list(nested)
+  }
+  expect_error(rho.bridge:::rho_json_encode(nested, max_depth = 2L), "nesting limit")
+  expect_error(rho.bridge:::rho_json_encode(list(1L, 2L), max_values = 2L), "value limit")
+  expect_error(rho.bridge:::rho_json_encode(1:3, max_values = 2L), "value limit")
 })
 
 test_that("render probe degrades cleanly when tooling is unavailable", {

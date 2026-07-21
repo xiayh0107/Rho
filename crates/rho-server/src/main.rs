@@ -8,6 +8,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use rho_agent_transport::{AgentAuthenticator, read_async_frame};
 use rho_kernel::{ArkLaunchConfig, ArkSession, KernelEvent};
+use rho_runtime_deps::{DependencyManager, EnsureOptions};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
@@ -26,8 +27,9 @@ enum Commands {
         host: IpAddr,
         #[arg(long, default_value_t = 8787)]
         port: u16,
-        #[arg(long, default_value = ".rho/state/runtime.sqlite")]
-        store: PathBuf,
+        /// SQLite state store. Defaults to PROJECT/.rho/state/runtime.sqlite.
+        #[arg(long)]
+        store: Option<PathBuf>,
         #[arg(long)]
         workspace_id: Option<String>,
         #[arg(long)]
@@ -36,8 +38,14 @@ enum Commands {
         #[arg(long)]
         kernelspec: Option<PathBuf>,
         /// Source package containing the rho.bridge R files.
-        #[arg(long, default_value = "r/rho.bridge")]
-        bridge_package: PathBuf,
+        #[arg(long)]
+        bridge_package: Option<PathBuf>,
+        /// Keep only the HTTP/WebSocket control plane online; do not prepare R/Ark.
+        #[arg(long)]
+        control_plane_only: bool,
+        /// Do not download missing runtime components.
+        #[arg(long)]
+        offline: bool,
     },
     /// Project a remote Rho runtime through a local browser/API gateway.
     Gateway {
@@ -106,6 +114,18 @@ enum Commands {
     },
 }
 
+struct ServeOptions {
+    host: IpAddr,
+    port: u16,
+    store: Option<PathBuf>,
+    workspace_id: Option<String>,
+    project_root: Option<PathBuf>,
+    kernelspec: Option<PathBuf>,
+    bridge_package: Option<PathBuf>,
+    control_plane_only: bool,
+    offline: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ToolStatus {
     name: &'static str,
@@ -133,8 +153,10 @@ async fn main() -> Result<()> {
             project_root,
             kernelspec,
             bridge_package,
+            control_plane_only,
+            offline,
         } => {
-            serve(
+            serve(ServeOptions {
                 host,
                 port,
                 store,
@@ -142,7 +164,9 @@ async fn main() -> Result<()> {
                 project_root,
                 kernelspec,
                 bridge_package,
-            )
+                control_plane_only,
+                offline,
+            })
             .await
         }
         Commands::Gateway {
@@ -209,29 +233,34 @@ async fn serve_gateway(host: IpAddr, port: u16, upstream: String) -> Result<()> 
     rho_server::gateway::serve(listener, state).await
 }
 
-async fn serve(
-    host: IpAddr,
-    port: u16,
-    store: PathBuf,
-    workspace_id: Option<String>,
-    project_root: Option<PathBuf>,
-    kernelspec: Option<PathBuf>,
-    bridge_package: PathBuf,
-) -> Result<()> {
+async fn serve(options: ServeOptions) -> Result<()> {
+    let ServeOptions {
+        host,
+        port,
+        store,
+        workspace_id,
+        project_root,
+        kernelspec,
+        bridge_package,
+        control_plane_only,
+        offline,
+    } = options;
+    let project_root = project_root
+        .unwrap_or(env::current_dir().context("resolving the Rho project directory")?)
+        .canonicalize()
+        .context("resolving the Rho project root")?;
+    let store = resolve_runtime_store_path(store, Some(&project_root));
+    let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .with_context(|| format!("binding Rho runtime to {host}:{port}"))?;
     let mut config = rho_server::runtime::RuntimeServiceConfig::new(store);
     if let Some(workspace_id) = workspace_id {
         config = config.with_workspace_id(workspace_id);
     }
-    if let Some(project_root) = project_root {
-        config = config.with_project_root(project_root);
-    }
+    config = config.with_project_root(project_root.clone());
     let runtime = rho_server::runtime::RuntimeService::open(config)?;
-    if let Some(kernelspec) = kernelspec {
-        runtime.start_ark(kernelspec, bridge_package).await?;
-    }
-    let listener = tokio::net::TcpListener::bind((host, port))
-        .await
-        .with_context(|| format!("binding Rho runtime to {host}:{port}"))?;
+    let dependencies = DependencyManager::new(&project_root)?;
+    runtime.set_dependency_manager(dependencies.clone()).await;
     let address = listener.local_addr()?;
     let workspace = runtime.workspace().await;
     println!(
@@ -240,13 +269,57 @@ async fn serve(
             "status": "listening",
             "address": address,
             "workspace_id": workspace.workspace_id,
+            "dependency_mode": if control_plane_only { "control_plane_only" } else { "managed" },
             "protocol_version": rho_protocol::WORKBENCH_PROTOCOL_VERSION
         })
     );
+    if control_plane_only {
+        tokio::spawn(async move {
+            if let Err(error) = dependencies.inspect().await {
+                eprintln!("rho-server dependency inspection failed: {error:#}");
+            }
+        });
+    } else if let Some(kernelspec) = kernelspec {
+        let bridge_package = match bridge_package {
+            Some(path) => path,
+            None => dependencies.prepare_bridge_package()?,
+        };
+        let startup_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = startup_runtime.start_ark(kernelspec, bridge_package).await {
+                eprintln!("rho-server could not start the configured Workspace R: {error:#}");
+            }
+        });
+    } else {
+        let startup_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = startup_runtime
+                .ensure_managed_workspace(EnsureOptions {
+                    offline,
+                    ..EnsureOptions::default()
+                })
+                .await
+            {
+                eprintln!("rho-server dependency preparation failed: {error:#}");
+            }
+        });
+    }
     let server_result = rho_server::api::serve(listener, runtime.clone()).await;
     let shutdown_result = runtime.shutdown_executor().await;
     server_result?;
     shutdown_result
+}
+
+fn resolve_runtime_store_path(
+    explicit_store: Option<PathBuf>,
+    project_root: Option<&Path>,
+) -> PathBuf {
+    explicit_store.unwrap_or_else(|| {
+        project_root.map_or_else(
+            || PathBuf::from(".rho/state/runtime.sqlite"),
+            |project_root| project_root.join(".rho/state/runtime.sqlite"),
+        )
+    })
 }
 
 async fn probe_rich_output(kernelspec: PathBuf) -> Result<()> {
@@ -642,4 +715,61 @@ fn is_file(path: &Path) -> bool {
     path.metadata()
         .map(|value| value.is_file())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn runtime_store_defaults_to_the_project_state_directory() {
+        assert_eq!(
+            resolve_runtime_store_path(None, Some(Path::new("/project"))),
+            PathBuf::from("/project/.rho/state/runtime.sqlite")
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_store_wins_over_the_project_default() {
+        assert_eq!(
+            resolve_runtime_store_path(
+                Some(PathBuf::from("/custom/runtime.sqlite")),
+                Some(Path::new("/project")),
+            ),
+            PathBuf::from("/custom/runtime.sqlite")
+        );
+    }
+
+    #[test]
+    fn runtime_store_without_a_project_keeps_the_existing_relative_default() {
+        assert_eq!(
+            resolve_runtime_store_path(None, None),
+            PathBuf::from(".rho/state/runtime.sqlite")
+        );
+    }
+
+    #[tokio::test]
+    async fn port_collision_precedes_default_store_creation() {
+        let directory = TempDir::new().unwrap();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let error = serve(ServeOptions {
+            host: "127.0.0.1".parse().unwrap(),
+            port,
+            store: None,
+            workspace_id: None,
+            project_root: Some(directory.path().to_path_buf()),
+            kernelspec: None,
+            bridge_package: None,
+            control_plane_only: true,
+            offline: false,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("binding Rho runtime"));
+        assert!(!directory.path().join(".rho").exists());
+    }
 }

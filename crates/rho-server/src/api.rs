@@ -1,23 +1,32 @@
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, ensure};
+use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use rho_mcp::{McpBackend, McpServer};
 use rho_protocol::{
     ApiError, ApiResponse, Approval, ApprovalStatus, Artifact, ArtifactKind, ClientKind, DeepLink,
-    EventPage, EventStreamMessage, ExecuteRunRequest, Object as ProtocolObject, Problem,
-    ProblemSeverity, Provenance, ProvenanceEdge, ProvenanceNode, ProvenanceNodeKind,
-    Run as ProtocolRun, RuntimeHealth, Workspace, WorkspaceLifecycle, workbench_protocol_schema,
+    DependencyReport, DependencySummary, EventPage, EventStreamMessage, ExecuteRunRequest,
+    Object as ProtocolObject, Problem, ProblemSeverity, Provenance, ProvenanceEdge, ProvenanceNode,
+    ProvenanceNodeKind, Run as ProtocolRun, RuntimeHealth, Workspace, WorkspaceLifecycle,
+    workbench_protocol_schema,
 };
+use rho_runtime_deps::EnsureOptions;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, broadcast};
 use uuid::Uuid;
 
 use crate::policy::{PolicyAction, PolicyDecision, PolicyEngine, PolicyPrincipal};
@@ -25,10 +34,21 @@ use crate::runtime::RuntimeService;
 
 const MAX_EVENT_PAGE: usize = 1_000;
 const DEFAULT_EVENT_PAGE: usize = 100;
+const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_MCP_SESSIONS: usize = 256;
+const MCP_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const MCP_SESSION_ID_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
 
 #[derive(Clone)]
 struct ApiState {
     runtime: RuntimeService,
+    mcp_sessions: Arc<TokioRwLock<HashMap<String, McpHttpSession>>>,
+}
+
+struct McpHttpSession {
+    workspace_id: String,
+    server: Arc<TokioMutex<McpServer>>,
+    last_activity: Instant,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,12 +64,44 @@ struct ListQuery {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DependencyActionRequest {
+    action: String,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    offline: bool,
+}
+
 pub fn router(runtime: RuntimeService) -> Router {
+    let state = ApiState {
+        runtime,
+        mcp_sessions: Arc::new(TokioRwLock::new(HashMap::new())),
+    };
     Router::new()
         .route("/", get(web_index))
         .route("/app.js", get(web_javascript))
         .route("/styles.css", get(web_styles))
+        .route("/agent-setup.md", get(agent_setup))
+        .route(
+            "/agent/skills/operate-rho-runtime/SKILL.md",
+            get(agent_skill),
+        )
+        .route(
+            "/agent/skills/operate-rho-runtime/agents/openai.yaml",
+            get(agent_skill_metadata),
+        )
+        .route(
+            "/agent/skills/operate-rho-runtime/references/workbench-protocol.md",
+            get(agent_skill_protocol),
+        )
         .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
+        .route(
+            "/v1/runtime/dependencies",
+            get(runtime_dependencies).post(runtime_dependency_action),
+        )
         .route("/v1/schema", get(schema))
         .route("/v1/workspaces/current", get(current_workspace))
         .route("/v1/workspaces/{workspace_id}", get(workspace))
@@ -77,7 +129,13 @@ pub fn router(runtime: RuntimeService) -> Router {
             "/v1/workspaces/{workspace_id}/events/ws",
             get(workspace_events_ws),
         )
-        .with_state(ApiState { runtime })
+        .route(
+            "/v1/workspaces/{workspace_id}/mcp",
+            get(mcp_workspace_get)
+                .post(mcp_workspace_post)
+                .delete(mcp_workspace_delete),
+        )
+        .with_state(state)
 }
 
 async fn web_index() -> Html<&'static str> {
@@ -98,6 +156,335 @@ async fn web_styles() -> impl IntoResponse {
     )
 }
 
+async fn agent_setup() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../../docs/agent-setup.md"),
+    )
+}
+
+async fn agent_skill() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../../.agents/skills/operate-rho-runtime/SKILL.md"),
+    )
+}
+
+async fn agent_skill_metadata() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        include_str!("../../../.agents/skills/operate-rho-runtime/agents/openai.yaml"),
+    )
+}
+
+async fn agent_skill_protocol() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!(
+            "../../../.agents/skills/operate-rho-runtime/references/workbench-protocol.md"
+        ),
+    )
+}
+
+async fn mcp_get() -> Response {
+    mcp_method_not_allowed()
+}
+
+async fn mcp_workspace_get(AxumPath(_workspace_id): AxumPath<String>) -> Response {
+    mcp_method_not_allowed()
+}
+
+async fn mcp_post(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+    handle_mcp_post(state, None, headers, body).await
+}
+
+async fn mcp_workspace_post(
+    AxumPath(workspace_id): AxumPath<String>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_mcp_post(state, Some(workspace_id), headers, body).await
+}
+
+async fn handle_mcp_post(
+    state: ApiState,
+    requested_workspace_id: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !is_json_content_type(&headers) {
+        return mcp_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Value::Null,
+            -32600,
+            "MCP requests require Content-Type: application/json",
+        );
+    }
+    if body.len() > MAX_MCP_MESSAGE_BYTES {
+        return mcp_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Value::Null,
+            -32600,
+            "MCP message exceeds 1 MiB",
+        );
+    }
+    let message = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(message)) => Value::Object(message),
+        Ok(_) => {
+            return mcp_error_response(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32600,
+                "MCP message must be a JSON object",
+            );
+        }
+        Err(error) => {
+            return mcp_error_response(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32700,
+                &format!("Parse error: {error}"),
+            );
+        }
+    };
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    let workspace = state.runtime.workspace().await;
+    if requested_workspace_id
+        .as_deref()
+        .is_some_and(|requested| requested != workspace.workspace_id)
+    {
+        return mcp_error_response(
+            StatusCode::NOT_FOUND,
+            id,
+            -32004,
+            &format!(
+                "Workspace `{}` does not exist",
+                requested_workspace_id.as_deref().unwrap_or_default()
+            ),
+        );
+    }
+
+    let method = message.get("method").and_then(Value::as_str);
+    if method == Some("initialize") {
+        if headers.contains_key(&MCP_SESSION_ID_HEADER) {
+            return mcp_error_response(
+                StatusCode::BAD_REQUEST,
+                id,
+                -32600,
+                "initialize must not include an MCP session ID",
+            );
+        }
+        if message.get("id").is_none()
+            || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || message
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return mcp_error_response(
+                StatusCode::BAD_REQUEST,
+                id,
+                -32600,
+                "initialize requires JSON-RPC 2.0, an id, and params.protocolVersion",
+            );
+        }
+        let workspace_id = workspace.workspace_id;
+        let mut server = McpServer::with_backend(RuntimeMcpBackend {
+            runtime: state.runtime.clone(),
+            workspace_id: workspace_id.clone(),
+        });
+        let Some(response) = server.handle(message).await else {
+            return mcp_error_response(
+                StatusCode::BAD_REQUEST,
+                id,
+                -32600,
+                "initialize did not produce a response",
+            );
+        };
+        let session_id = format!("mcp_session_{}", Uuid::new_v4().simple());
+        let mut sessions = state.mcp_sessions.write().await;
+        retain_live_mcp_sessions(&mut sessions);
+        if sessions.len() >= MAX_MCP_SESSIONS {
+            return mcp_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32000,
+                "Rho has reached the active MCP session limit",
+            );
+        }
+        sessions.insert(
+            session_id.clone(),
+            McpHttpSession {
+                workspace_id,
+                server: Arc::new(TokioMutex::new(server)),
+                last_activity: Instant::now(),
+            },
+        );
+        return mcp_json_response(StatusCode::OK, response, Some(&session_id));
+    }
+
+    let Some(session_id) = mcp_session_id(&headers) else {
+        return mcp_error_response(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32001,
+            "Mcp-Session-Id is required after initialize",
+        );
+    };
+    let (session_workspace_id, server) = {
+        let mut sessions = state.mcp_sessions.write().await;
+        retain_live_mcp_sessions(&mut sessions);
+        let Some(session) = sessions.get_mut(session_id) else {
+            return mcp_error_response(
+                StatusCode::NOT_FOUND,
+                id,
+                -32001,
+                "MCP session was not found; initialize a new session",
+            );
+        };
+        session.last_activity = Instant::now();
+        (session.workspace_id.clone(), session.server.clone())
+    };
+    if session_workspace_id != workspace.workspace_id {
+        return mcp_error_response(
+            StatusCode::NOT_FOUND,
+            id,
+            -32004,
+            "The MCP session's workspace is no longer active",
+        );
+    }
+    let response = server.lock().await.handle(message).await;
+    match response {
+        Some(response) => mcp_json_response(StatusCode::OK, response, Some(session_id)),
+        None => mcp_empty_response(StatusCode::ACCEPTED, Some(session_id)),
+    }
+}
+
+async fn mcp_delete(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    handle_mcp_delete(state, None, headers).await
+}
+
+async fn mcp_workspace_delete(
+    AxumPath(workspace_id): AxumPath<String>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    handle_mcp_delete(state, Some(workspace_id), headers).await
+}
+
+async fn handle_mcp_delete(
+    state: ApiState,
+    requested_workspace_id: Option<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session_id) = mcp_session_id(&headers) else {
+        return mcp_error_response(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32001,
+            "Mcp-Session-Id is required",
+        );
+    };
+    let mut sessions = state.mcp_sessions.write().await;
+    retain_live_mcp_sessions(&mut sessions);
+    let Some(session_workspace_id) = sessions
+        .get(session_id)
+        .map(|session| session.workspace_id.clone())
+    else {
+        return mcp_error_response(
+            StatusCode::NOT_FOUND,
+            Value::Null,
+            -32001,
+            "MCP session was not found",
+        );
+    };
+    if requested_workspace_id
+        .as_deref()
+        .is_some_and(|requested| requested != session_workspace_id)
+    {
+        return mcp_error_response(
+            StatusCode::NOT_FOUND,
+            Value::Null,
+            -32004,
+            "MCP session does not belong to this workspace",
+        );
+    }
+    sessions.remove(session_id);
+    mcp_empty_response(StatusCode::NO_CONTENT, None)
+}
+
+fn retain_live_mcp_sessions(sessions: &mut HashMap<String, McpHttpSession>) {
+    let now = Instant::now();
+    sessions.retain(|_, session| {
+        now.saturating_duration_since(session.last_activity) <= MCP_SESSION_TTL
+    });
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn mcp_session_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(&MCP_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn mcp_json_response(status: StatusCode, body: Value, session_id: Option<&str>) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    if let Some(session_id) = session_id
+        && let Ok(value) = HeaderValue::from_str(session_id)
+    {
+        response
+            .headers_mut()
+            .insert(MCP_SESSION_ID_HEADER.clone(), value);
+    }
+    response
+}
+
+fn mcp_empty_response(status: StatusCode, session_id: Option<&str>) -> Response {
+    let mut response = status.into_response();
+    if let Some(session_id) = session_id
+        && let Ok(value) = HeaderValue::from_str(session_id)
+    {
+        response
+            .headers_mut()
+            .insert(MCP_SESSION_ID_HEADER.clone(), value);
+    }
+    response
+}
+
+fn mcp_error_response(status: StatusCode, id: Value, code: i64, message: &str) -> Response {
+    mcp_json_response(
+        status,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message}
+        }),
+        None,
+    )
+}
+
+fn mcp_method_not_allowed() -> Response {
+    let mut response = mcp_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        Value::Null,
+        -32600,
+        "This Rho MCP endpoint does not provide an SSE GET stream",
+    );
+    response
+        .headers_mut()
+        .insert("allow", HeaderValue::from_static("POST, DELETE"));
+    response
+}
+
 pub async fn serve(listener: TcpListener, runtime: RuntimeService) -> Result<()> {
     axum::serve(listener, router(runtime))
         .await
@@ -105,17 +492,127 @@ pub async fn serve(listener: TcpListener, runtime: RuntimeService) -> Result<()>
 }
 
 async fn health(State(state): State<ApiState>) -> Json<ApiResponse<RuntimeHealth>> {
-    let workspace = state.runtime.workspace().await;
-    let connected_clients = state.runtime.client_sessions().await.len();
     Json(ApiResponse::new(
         request_id(),
-        RuntimeHealth {
-            status: "ok".to_string(),
-            workspace_id: workspace.workspace_id,
-            lifecycle: workspace.lifecycle,
-            connected_clients,
-        },
+        runtime_health(&state.runtime).await,
     ))
+}
+
+async fn readiness(
+    State(state): State<ApiState>,
+) -> Result<Json<ApiResponse<RuntimeHealth>>, ApiFailure> {
+    let request_id = request_id();
+    let health = runtime_health(&state.runtime).await;
+    if health.workspace_r_ready {
+        Ok(Json(ApiResponse::new(request_id, health)))
+    } else {
+        Err(ApiFailure::unavailable(
+            &request_id,
+            "workspace_r_not_ready",
+            "Workspace R execution is not ready; inspect /healthz for lifecycle details",
+        ))
+    }
+}
+
+async fn runtime_health(runtime: &RuntimeService) -> RuntimeHealth {
+    let workspace = runtime.workspace().await;
+    let dependency_report = runtime.dependency_report().await;
+    let executor_attached = runtime.has_executor().await;
+    let workspace_r_ready = executor_attached
+        && matches!(
+            workspace.lifecycle,
+            WorkspaceLifecycle::Ready | WorkspaceLifecycle::Busy
+        );
+    RuntimeHealth {
+        status: "ok".to_string(),
+        control_plane_ready: true,
+        workspace_id: workspace.workspace_id,
+        project_root: workspace.project_root,
+        lifecycle: workspace.lifecycle,
+        executor_attached,
+        workspace_r_ready,
+        dependencies: DependencySummary::from(&dependency_report),
+        connected_clients: runtime.client_sessions().await.len(),
+    }
+}
+
+async fn runtime_dependencies(
+    State(state): State<ApiState>,
+) -> Json<ApiResponse<DependencyReport>> {
+    Json(ApiResponse::new(
+        request_id(),
+        state.runtime.dependency_report().await,
+    ))
+}
+
+async fn runtime_dependency_action(
+    State(state): State<ApiState>,
+    Json(request): Json<DependencyActionRequest>,
+) -> Result<Json<ApiResponse<DependencyReport>>, ApiFailure> {
+    let request_id = request_id();
+    if request.action == "open_r_installer" {
+        if !request.confirmed {
+            return Err(ApiFailure::bad_request(
+                &request_id,
+                "dependency_confirmation_required",
+                "Opening the operating-system R installer requires confirmed=true",
+            ));
+        }
+        let manager = state.runtime.dependency_manager().await.ok_or_else(|| {
+            ApiFailure::unavailable(
+                &request_id,
+                "dependency_manager_unavailable",
+                "Rho Dependency Manager is not configured",
+            )
+        })?;
+        manager
+            .open_verified_r_installer()
+            .await
+            .map_err(|error| ApiFailure::internal(&request_id, error))?;
+        return Ok(Json(ApiResponse::new(
+            request_id,
+            state.runtime.dependency_report().await,
+        )));
+    }
+    let options = match request.action.as_str() {
+        "ensure" => EnsureOptions {
+            offline: request.offline,
+            ..EnsureOptions::default()
+        },
+        "repair" if request.confirmed => EnsureOptions {
+            offline: request.offline,
+            repair: true,
+            ..EnsureOptions::default()
+        },
+        "install_r" if request.confirmed => EnsureOptions {
+            offline: request.offline,
+            install_r: true,
+            ..EnsureOptions::default()
+        },
+        "repair" | "install_r" => {
+            return Err(ApiFailure::bad_request(
+                &request_id,
+                "dependency_confirmation_required",
+                "This dependency action changes installed runtime components and requires confirmed=true",
+            ));
+        }
+        _ => {
+            return Err(ApiFailure::bad_request(
+                &request_id,
+                "unknown_dependency_action",
+                "Dependency action must be ensure, repair, install_r, or open_r_installer",
+            ));
+        }
+    };
+    state
+        .runtime
+        .ensure_managed_workspace(options)
+        .await
+        .map_err(|error| ApiFailure::internal(&request_id, error))?;
+    Ok(Json(ApiResponse::new(
+        request_id,
+        state.runtime.dependency_report().await,
+    )))
 }
 
 async fn schema() -> Json<ApiResponse<Value>> {
@@ -184,13 +681,23 @@ async fn list_runs(
 async fn execute_run(
     AxumPath(workspace_id): AxumPath<String>,
     State(state): State<ApiState>,
-    Json(mut request): Json<ExecuteRunRequest>,
+    Json(request): Json<ExecuteRunRequest>,
 ) -> Result<Json<ApiResponse<ProtocolRun>>, ApiFailure> {
     let request_id = request_id();
-    let workspace = require_workspace(&state.runtime, &workspace_id, &request_id).await?;
+    let run = execute_runtime_request(&state.runtime, &workspace_id, request, &request_id).await?;
+    Ok(Json(ApiResponse::new(request_id, run)))
+}
+
+async fn execute_runtime_request(
+    runtime: &RuntimeService,
+    workspace_id: &str,
+    mut request: ExecuteRunRequest,
+    request_id: &str,
+) -> Result<ProtocolRun, ApiFailure> {
+    let workspace = require_workspace(runtime, workspace_id, request_id).await?;
     if request.code.trim().is_empty() {
         return Err(ApiFailure::bad_request(
-            &request_id,
+            request_id,
             "empty_code",
             "R code must not be empty",
         ));
@@ -204,36 +711,35 @@ async fn execute_run(
     if !policy.permits_execution() {
         return Err(match policy {
             PolicyDecision::RequireBrokerApproval => ApiFailure::approval_required(
-                &request_id,
+                request_id,
                 "approval_required",
                 "Agent mutations require a live broker approval bound to the exact arguments",
             ),
             PolicyDecision::Deny => ApiFailure::forbidden(
-                &request_id,
+                request_id,
                 "policy_denied",
                 "This client boundary is read-only",
             ),
             _ => ApiFailure::forbidden(
-                &request_id,
+                request_id,
                 "policy_denied",
                 "The policy engine denied this execution",
             ),
         });
     }
-    if !state.runtime.has_executor().await {
+    if !runtime.has_executor().await {
         let message = if workspace.lifecycle == WorkspaceLifecycle::Disconnected {
             "Workspace R is disconnected; start the configured Ark runtime before executing code"
         } else {
             "This runtime does not have an execution backend attached"
         };
         return Err(ApiFailure::unavailable(
-            &request_id,
+            request_id,
             "runtime_execution_unavailable",
             message,
         ));
     }
-    state
-        .runtime
+    runtime
         .emit_event(
             rho_protocol::RuntimeEventKind::RunStarted,
             serde_json::json!({
@@ -245,15 +751,99 @@ async fn execute_run(
             Some(workspace.deep_link.clone()),
         )
         .await
-        .map_err(|error| ApiFailure::internal(&request_id, error))?;
-    let execution = state
-        .runtime
+        .map_err(|error| ApiFailure::internal(request_id, error))?;
+    let execution = runtime
         .execute(request)
         .await
-        .map_err(|error| ApiFailure::internal(&request_id, error))?;
-    let run = protocol_run_detail(execution.run, &workspace_id)
-        .map_err(|error| ApiFailure::internal(&request_id, error))?;
-    Ok(Json(ApiResponse::new(request_id, run)))
+        .map_err(|error| ApiFailure::internal(request_id, error))?;
+    let run = protocol_run_detail(execution.run, workspace_id)
+        .map_err(|error| ApiFailure::internal(request_id, error))?;
+    Ok(run)
+}
+
+#[derive(Clone)]
+struct RuntimeMcpBackend {
+    runtime: RuntimeService,
+    workspace_id: String,
+}
+
+impl RuntimeMcpBackend {
+    async fn bound_workspace(&self) -> Result<Workspace> {
+        let workspace = self.runtime.workspace().await;
+        ensure!(
+            workspace.workspace_id == self.workspace_id,
+            "Workspace `{}` is no longer active",
+            self.workspace_id
+        );
+        Ok(workspace)
+    }
+}
+
+#[async_trait]
+impl McpBackend for RuntimeMcpBackend {
+    async fn status(&self) -> Result<Workspace> {
+        self.bound_workspace().await
+    }
+
+    async fn execute(&self, request: ExecuteRunRequest) -> Result<ProtocolRun> {
+        self.bound_workspace().await?;
+        execute_runtime_request(&self.runtime, &self.workspace_id, request, &request_id())
+            .await
+            .map_err(api_failure_error)
+    }
+
+    async fn objects(&self) -> Result<Vec<ProtocolObject>> {
+        self.bound_workspace().await?;
+        self.runtime.scientific_objects().await
+    }
+
+    async fn inspect_object(&self, object: &str) -> Result<ProtocolObject> {
+        self.bound_workspace().await?;
+        self.runtime
+            .inspect_object(object)
+            .await?
+            .with_context(|| format!("Object `{object}` was not found"))
+    }
+
+    async fn runs(&self) -> Result<Vec<ProtocolRun>> {
+        self.bound_workspace().await?;
+        self.runtime
+            .list_runs(None)
+            .await?
+            .into_iter()
+            .map(|run| protocol_run(run, &self.workspace_id))
+            .collect()
+    }
+
+    async fn problems(&self) -> Result<Vec<Problem>> {
+        self.bound_workspace().await?;
+        self.runtime
+            .list_problems(None)
+            .await?
+            .into_iter()
+            .map(|problem| protocol_problem(problem, &self.workspace_id))
+            .collect()
+    }
+
+    async fn plots(&self) -> Result<Vec<Artifact>> {
+        self.bound_workspace().await?;
+        self.runtime
+            .list_plot_artifacts(None)
+            .await?
+            .into_iter()
+            .map(|plot| protocol_plot(plot, &self.workspace_id))
+            .collect()
+    }
+}
+
+fn api_failure_error(failure: ApiFailure) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Rho API {} (HTTP {}): {} [retryable={}]",
+        failure.body.code,
+        failure.status.as_u16(),
+        failure.body.message,
+        failure.body.retryable
+    )
 }
 
 async fn list_problems(
@@ -971,7 +1561,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let runtime = RuntimeService::open(
             crate::runtime::RuntimeServiceConfig::new(directory.path().join("runtime.sqlite"))
-                .with_workspace_id("ws_api"),
+                .with_workspace_id("ws_api")
+                .with_project_root(directory.path()),
         )
         .unwrap();
         (directory, runtime)
@@ -987,18 +1578,299 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    async fn post_json(app: Router, uri: &str, value: Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn mcp_request(
+        app: Router,
+        uri: &str,
+        body: impl Into<Body>,
+        session_id: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Option<Value>) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(session_id) = session_id {
+            request = request.header(&MCP_SESSION_ID_HEADER, session_id);
+        }
+        let response = app
+            .oneshot(request.body(body.into()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = (!body.is_empty()).then(|| serde_json::from_slice(&body).unwrap());
+        (status, headers, value)
+    }
+
+    #[tokio::test]
+    async fn streamable_http_mcp_initializes_lists_tools_and_opens_the_workspace() {
+        let (_directory, runtime) = test_runtime();
+        let app = router(runtime);
+        let (status, headers, initialize) = mcp_request(
+            app.clone(),
+            "/mcp",
+            Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "api-test", "version": "1"}
+                    }
+                })
+                .to_string(),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let session_id = headers[MCP_SESSION_ID_HEADER].to_str().unwrap();
+        let initialize = initialize.unwrap();
+        assert_eq!(initialize["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(initialize["result"]["serverInfo"]["name"], "rho-mcp");
+
+        let (status, headers, initialized) = mcp_request(
+            app.clone(),
+            "/mcp",
+            Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                })
+                .to_string(),
+            ),
+            Some(session_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(headers[MCP_SESSION_ID_HEADER], session_id);
+        assert!(initialized.is_none());
+
+        let (status, _, tools) = mcp_request(
+            app.clone(),
+            "/mcp",
+            Body::from(
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                    .to_string(),
+            ),
+            Some(session_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tools = tools.unwrap();
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "workspace_open",
+                "workspace_status",
+                "workspace_execute",
+                "object_inspect",
+                "run_history",
+                "problem_list",
+                "artifact_export",
+                "plot_view"
+            ]
+        );
+
+        let (status, _, workspace) = mcp_request(
+            app,
+            "/mcp",
+            Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "workspace_open", "arguments": {}}
+                })
+                .to_string(),
+            ),
+            Some(session_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let workspace = workspace.unwrap();
+        assert_eq!(workspace["result"]["isError"], false);
+        assert_eq!(
+            workspace["result"]["structuredContent"]["data"]["workspace"]["workspace_id"],
+            "ws_api"
+        );
+        assert_eq!(
+            workspace["result"]["structuredContent"]["data"]["objects"],
+            json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn streamable_http_mcp_rejects_wrong_workspaces_and_invalid_requests() {
+        let (_directory, runtime) = test_runtime();
+        let app = router(runtime);
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "api-test", "version": "1"}
+            }
+        });
+
+        let (status, _, wrong_workspace) = mcp_request(
+            app.clone(),
+            "/v1/workspaces/ws_missing/mcp",
+            Body::from(initialize.to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(wrong_workspace.unwrap()["error"]["code"], -32004);
+
+        let (status, _, parse_error) =
+            mcp_request(app.clone(), "/mcp", Body::from("not json"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parse_error.unwrap()["error"]["code"], -32700);
+
+        let (status, _, invalid_shape) =
+            mcp_request(app.clone(), "/mcp", Body::from("[]"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_shape.unwrap()["error"]["code"], -32600);
+
+        let (status, _, missing_session) = mcp_request(
+            app,
+            "/mcp",
+            Body::from(
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                    .to_string(),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(missing_session.unwrap()["error"]["code"], -32001);
+    }
+
     #[tokio::test]
     async fn health_and_workspace_are_available_without_a_gui_client() {
         let (_directory, runtime) = test_runtime();
         let app = router(runtime);
         let (status, health) = get(app.clone(), "/healthz").await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["data"]["status"], "ok");
+        assert_eq!(health["data"]["control_plane_ready"], true);
         assert_eq!(health["data"]["workspace_id"], "ws_api");
+        assert!(health["data"]["project_root"].as_str().is_some());
+        assert_eq!(health["data"]["lifecycle"], "disconnected");
+        assert_eq!(health["data"]["executor_attached"], false);
+        assert_eq!(health["data"]["workspace_r_ready"], false);
+        assert_eq!(health["data"]["dependencies"]["ready"], false);
+        assert_eq!(
+            health["data"]["dependencies"]["issue_code"],
+            "dependency.manager_not_configured"
+        );
         assert_eq!(health["data"]["connected_clients"], 0);
 
         let (status, workspace) = get(app, "/v1/workspaces/current").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(workspace["data"]["workspace_id"], "ws_api");
+    }
+
+    #[tokio::test]
+    async fn dependency_endpoint_is_structured_without_a_manager() {
+        let (_directory, runtime) = test_runtime();
+        let app = router(runtime);
+
+        let (status, report) = get(app.clone(), "/v1/runtime/dependencies").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["data"]["schema_version"], "1");
+        assert_eq!(report["data"]["status"], "action_required");
+        assert_eq!(report["data"]["ready"], false);
+        assert_eq!(
+            report["data"]["issue"]["code"],
+            "dependency.manager_not_configured"
+        );
+
+        let (status, error) = post_json(
+            app.clone(),
+            "/v1/runtime/dependencies",
+            json!({"action": "repair"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "dependency_confirmation_required");
+
+        let (status, error) = post_json(
+            app,
+            "/v1/runtime/dependencies",
+            json!({"action": "launch_an_unmanaged_r"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "unknown_dependency_action");
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_an_attached_ready_or_busy_executor() {
+        let (_directory, runtime) = test_runtime();
+
+        let (status, unavailable) = get(router(runtime.clone()), "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["code"], "workspace_r_not_ready");
+        assert_eq!(unavailable["retryable"], true);
+
+        let identity = runtime.workspace().await.identity;
+        runtime
+            .attach_executor(Arc::new(FakeExecutor::new(identity)))
+            .await
+            .unwrap();
+        let (status, ready) = get(router(runtime.clone()), "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ready["data"]["executor_attached"], true);
+        assert_eq!(ready["data"]["workspace_r_ready"], true);
+        assert_eq!(ready["data"]["lifecycle"], "ready");
+
+        runtime
+            .set_lifecycle(WorkspaceLifecycle::Busy)
+            .await
+            .unwrap();
+        let (status, busy) = get(router(runtime.clone()), "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(busy["data"]["workspace_r_ready"], true);
+        assert_eq!(busy["data"]["lifecycle"], "busy");
+
+        runtime
+            .set_lifecycle(WorkspaceLifecycle::Disconnected)
+            .await
+            .unwrap();
+        let (status, unavailable) = get(router(runtime), "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable["code"], "workspace_r_not_ready");
     }
 
     #[tokio::test]
@@ -1014,6 +1886,7 @@ mod tests {
         assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Runtime dependencies"));
         for page in [
             "Runs",
             "Objects",
@@ -1038,7 +1911,52 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let script = String::from_utf8(body.to_vec()).unwrap();
         assert!(script.contains("/events/ws?client=web"));
+        assert!(script.contains("/v1/runtime/dependencies"));
+        assert!(script.contains("Start Workspace R"));
+        assert!(script.contains("install Rho's official skill"));
         assert!(script.contains("renderProvenance"));
+        assert!(script.contains("/agent-setup.md"));
+    }
+
+    #[tokio::test]
+    async fn agent_setup_contract_and_official_skill_are_served() {
+        let (_directory, runtime) = test_runtime();
+        let app = router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent-setup.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let setup = String::from_utf8(body.to_vec()).unwrap();
+        assert!(setup.contains("install Rho's official runtime skill"));
+        assert!(setup.contains("workspace_open"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/skills/operate-rho-runtime/SKILL.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let skill = String::from_utf8(body.to_vec()).unwrap();
+        assert!(skill.contains("name: operate-rho-runtime"));
+        assert!(skill.contains("## Connect"));
     }
 
     #[tokio::test]

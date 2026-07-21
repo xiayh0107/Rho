@@ -585,12 +585,7 @@ pub async fn dispatch_workspace_request(
     let bridge_call = format!(
         r#"local({{
   result <- {bridge_expression}
-  payload <- charToRaw(jsonlite::toJSON(
-    result,
-    auto_unbox = TRUE,
-    null = "null",
-    digits = NA
-  ))
+  payload <- charToRaw(getOption("rho.bridge.env")$rho_json_encode(result))
   connection <- file({temporary_path}, open = "wb")
   on.exit(close(connection), add = TRUE)
   writeBin(payload, connection)
@@ -1684,6 +1679,17 @@ mod tests {
         assert_eq!(
             read_bounded_json(br#"{"ok":true,"value":42}"#.as_slice()).unwrap(),
             json!({"ok": true, "value": 42})
+        );
+    }
+
+    #[test]
+    fn reads_base_r_bridge_json_with_unicode_escapes_and_nulls() {
+        assert_eq!(
+            read_bounded_json(
+                br#"{"text":"snow \u96ea\nline","values":[1,null,false]}"#.as_slice(),
+            )
+            .unwrap(),
+            json!({"text": "snow 雪\nline", "values": [1, null, false]})
         );
     }
 

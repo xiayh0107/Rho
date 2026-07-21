@@ -46,16 +46,65 @@
               <span id="connection-dot" class="status-dot"></span>
               <span id="workspace-label">Connecting…</span>
             </div>
+            <button id="connect-agent-button" class="connect-agent-button" type="button">Connect Agent</button>
             <button id="refresh-button" class="refresh-button" type="button">Refresh</button>
           </div>
         </header>
 
+        <section id="dependency-banner" class="dependency-banner checking" aria-label="Runtime dependencies" aria-live="polite">
+          <div>
+            <span class="dependency-kicker">Runtime dependencies</span>
+            <strong>Checking R and Ark…</strong>
+            <small>The control plane remains available while Workspace R is prepared.</small>
+          </div>
+        </section>
         <section id="runtime-summary" class="summary-grid" aria-label="Runtime summary"></section>
         <section id="view-content" class="content-panel" aria-live="polite">
           <div class="loading-state"><span></span>Reading scientific state…</div>
         </section>
       </main>
     </div>
+
+    <dialog id="agent-setup-dialog" class="setup-dialog" aria-labelledby="setup-title">
+      <div class="setup-dialog-card">
+        <header class="setup-dialog-head">
+          <div>
+            <p class="eyebrow">One-prompt setup</p>
+            <h2 id="setup-title">Connect your Agent</h2>
+          </div>
+          <button id="close-agent-setup" class="dialog-close" type="button" aria-label="Close Agent setup">×</button>
+        </header>
+        <p class="setup-intro">Paste this one sentence into Codex, Claude Code, or another Agent—even if it was opened outside this project. Setup configures the target project first and reports separately whether this Agent session has loaded MCP.</p>
+        <div class="setup-layer-grid" aria-label="Current Rho status">
+          <div class="setup-layer">
+            <span class="setup-layer-label">Control plane</span>
+            <strong id="setup-control-plane">Online</strong>
+            <small id="setup-runtime-url">Reading runtime URL…</small>
+          </div>
+          <div class="setup-layer">
+            <span class="setup-layer-label">Workspace R</span>
+            <strong id="setup-workspace-status">Reading lifecycle…</strong>
+            <small id="setup-workspace-meaning">Kernel readiness, not Agent registration</small>
+          </div>
+        </div>
+        <div class="official-skill">
+          <span class="skill-mark">ρ</span>
+          <span><strong>operate-rho-runtime</strong><small>Official Rho skill · installed project-locally</small></span>
+        </div>
+        <div class="setup-prompt-label"><span>One sentence</span><span>Project path + runtime URL included</span></div>
+        <pre class="setup-prompt"><code id="agent-setup-prompt">Preparing setup prompt…</code></pre>
+        <button id="copy-agent-setup" class="copy-setup-button" type="button">
+          <span aria-hidden="true">⧉</span>
+          <span id="copy-agent-setup-label">Copy one-sentence setup</span>
+        </button>
+        <div class="session-handoff">
+          <span>Codex new-session handoff</span>
+          <code id="codex-handoff">codex -C PROJECT_ROOT</code>
+          <small>Use only when the current session did not load this project's MCP configuration.</small>
+        </div>
+        <p class="setup-note">“Project configured” and “MCP active in this session” are different checkpoints. Rho preserves unrelated Agent configuration and never treats <code>disconnected</code> as client registration.</p>
+      </div>
+    </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </body>
 </html>

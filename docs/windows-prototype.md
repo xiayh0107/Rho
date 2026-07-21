@@ -95,9 +95,11 @@ target\debug\rho-desktop.exe --smoke-test
 target\debug\rho-desktop.exe --smoke-agent
 ```
 
-The repository does not track the 23 MB Ark executable. Run the Phase 0 Ark
-bootstrap before `scripts/build-windows-installer.ps1`; the build script copies
-the pinned, checksum-verified binary into the temporary desktop resource tree.
+The repository does not track the Ark executable. `rho deps ensure` publishes
+the pinned, checksum-verified artifact to Rho's shared dependency cache. The
+legacy Phase 0 bootstrap is now a thin wrapper around that command, and the
+installer build accepts only the verified cache entry before copying Ark, its
+license notices and verification receipt into the desktop resource tree.
 
 The desktop smoke test creates a data frame, receives a real plot, and finds
 the object in the Environment snapshot. The Agent smoke test additionally

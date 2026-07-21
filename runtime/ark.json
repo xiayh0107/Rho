@@ -1,4 +1,6 @@
 {
+  "deprecated": true,
+  "source_manifest": "runtime/dependencies.json",
   "version": "0.1.252",
   "windows-x64": {
     "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-windows-x64.zip",

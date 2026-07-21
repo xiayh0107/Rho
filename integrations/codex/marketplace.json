@@ -1,0 +1,20 @@
+{
+  "name": "rho-official",
+  "interface": {
+    "displayName": "Rho Official"
+  },
+  "plugins": [
+    {
+      "name": "rho",
+      "source": {
+        "source": "local",
+        "path": "./plugins/rho"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer"
+    }
+  ]
+}

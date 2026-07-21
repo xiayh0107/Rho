@@ -25,6 +25,17 @@ this file records behavior that is already available in a released build.
 - Unified action policy, provenance graph, and remote HTTP/WebSocket gateway.
 - Project-scoped Codex and Claude Code integrations, a Claude plugin, Agent
   skills, R project detection, and `rho init` bootstrap commands.
+- One-prompt Agent onboarding in the browser, with a runtime-served setup
+  contract and version-matched official `operate-rho-runtime` skill assets.
+- Idempotent Agent bootstrap with non-destructive config merging, a packaged
+  Codex plugin, one-call `rho doctor` diagnostics, and separate control-plane
+  versus Workspace R readiness signals.
+- A cwd-independent Streamable HTTP MCP endpoint built into `rho-server`, with
+  automatic migration from legacy Cargo/stdio Agent configs and stdin-capable
+  CLI execution fallback.
+- Rho Dependency Manager with compatible-R discovery, pinned and verified Ark
+  artifacts, embedded `rho.bridge`, project-controlled bindings, `rho deps`
+  diagnostics/repair, and managed Workspace R startup by default.
 
 ## 0.2.0-dev.2 - 2026-07-16
 

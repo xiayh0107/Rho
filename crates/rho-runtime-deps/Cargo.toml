@@ -1,23 +1,23 @@
 [package]
-name = "rho-cli"
+name = "rho-runtime-deps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "rho"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+chrono.workspace = true
+directories.workspace = true
+fs4.workspace = true
 reqwest.workspace = true
 rho-protocol = { path = "../rho-protocol" }
-rho-runtime-deps = { path = "../rho-runtime-deps" }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+uuid.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
-rho-server = { path = "../rho-server" }
 tempfile.workspace = true
