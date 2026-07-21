@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "r": {
+    "requirement": ">=4.4.0,<5.0.0",
+    "recommended_version": "4.6.1",
+    "license": "GPL-2.0-or-later",
+    "install_manager": {
+      "name": "rig",
+      "version": "0.8.1",
+      "release": "https://github.com/r-lib/rig/releases/tag/v0.8.1"
+    },
+    "installers": {
+      "darwin-arm64": {
+        "url": "https://cran.r-project.org/bin/macosx/sonoma-arm64/base/R-4.6.1-arm64.pkg",
+        "sha256": "67f6eea4ced4ce48f0a0d4fa3a1cac43d1859a05a88993ee3dff7c52e7edbc4b",
+        "minimum_os": "14"
+      },
+      "darwin-x64": {
+        "url": "https://cran.r-project.org/bin/macosx/big-sur-x86_64/base/R-4.6.1-x86_64.pkg",
+        "sha256": "612bb00cb4c627721d6d80b0f5224227c0fcdefb4a5b6c917511480361c16571",
+        "minimum_os": "11"
+      },
+      "windows-x64": {
+        "url": "https://cran.r-project.org/bin/windows/base/R-4.6.1-win.exe",
+        "sha256": "c5424c40cd70ef85765a55d2ff96bb602b5f30ed536938ff004f14db5db3c2df",
+        "minimum_os": "10"
+      }
+    }
+  },
+  "ark": {
+    "version": "0.1.252",
+    "minimum_r_version": "4.2.0",
+    "license": "MIT",
+    "release": "https://github.com/posit-dev/ark/releases/tag/0.1.252",
+    "artifacts": {
+      "darwin-arm64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-darwin-arm64.zip",
+        "sha256": "aa1186f6e1ad271abaf246fd76e0aa9039cdeeff2cb52147e8887060afd5fb07",
+        "size": 8456517,
+        "executable": "ark"
+      },
+      "darwin-x64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-darwin-x64.zip",
+        "sha256": "a8df8b55d951732b73fd05e8857b9c4b185b8dc9d6bc307f2ae5dcb84d4cc913",
+        "size": 8746138,
+        "executable": "ark"
+      },
+      "darwin-universal": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-darwin-universal.zip",
+        "sha256": "5655a80c495ee90965bc73fec58f15e4187d15bc9818c3355fa8096813ac6724",
+        "size": 17196572,
+        "executable": "ark"
+      },
+      "linux-arm64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-linux-arm64.zip",
+        "sha256": "aed35067f053c495d1e379649620df56142870f011695e1d88580ce32bcedefe",
+        "size": 7327045,
+        "executable": "ark",
+        "minimum_glibc": "2.26"
+      },
+      "linux-x64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-linux-x64.zip",
+        "sha256": "7dda5d05b6c4d67e7ae74e70b6bec5fd3bc526b19e222fa78306e14972cf4495",
+        "size": 7806220,
+        "executable": "ark",
+        "minimum_glibc": "2.26"
+      },
+      "windows-arm64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-windows-arm64.zip",
+        "sha256": "358372f5c2a8cf03307d575f11160d71adc18780cd6b1a8d9b4584d9805a21c2",
+        "size": 7561155,
+        "executable": "ark.exe"
+      },
+      "windows-x64": {
+        "url": "https://github.com/posit-dev/ark/releases/download/0.1.252/ark-0.1.252-windows-x64.zip",
+        "sha256": "a6c2c6ae931d0dd5e1f771243bf3df4f86968462bbd8e08ceeba7f2e53567e58",
+        "size": 8188981,
+        "executable": "ark.exe"
+      }
+    }
+  }
+}

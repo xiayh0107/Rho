@@ -10,6 +10,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow.workspace = true
 rho-server = { path = "../../crates/rho-server" }
+rho-runtime-deps = { path = "../../crates/rho-runtime-deps" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
 tokio.workspace = true

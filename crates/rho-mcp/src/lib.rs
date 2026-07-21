@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use rho_cli::RhoClient;
-use rho_protocol::{ClientKind, ExecuteRunRequest};
+use rho_protocol::{Artifact, ClientKind, ExecuteRunRequest, Object, Problem, Run, Workspace};
 use serde_json::{Map, Value, json};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -9,17 +12,63 @@ pub const MCP_SERVER_NAME: &str = "rho-mcp";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+#[async_trait]
+pub trait McpBackend: Send + Sync {
+    async fn status(&self) -> Result<Workspace>;
+    async fn execute(&self, request: ExecuteRunRequest) -> Result<Run>;
+    async fn objects(&self) -> Result<Vec<Object>>;
+    async fn inspect_object(&self, object: &str) -> Result<Object>;
+    async fn runs(&self) -> Result<Vec<Run>>;
+    async fn problems(&self) -> Result<Vec<Problem>>;
+    async fn plots(&self) -> Result<Vec<Artifact>>;
+}
+
+#[async_trait]
+impl McpBackend for RhoClient {
+    async fn status(&self) -> Result<Workspace> {
+        RhoClient::status(self).await
+    }
+
+    async fn execute(&self, request: ExecuteRunRequest) -> Result<Run> {
+        RhoClient::execute(self, &request).await
+    }
+
+    async fn objects(&self) -> Result<Vec<Object>> {
+        RhoClient::objects(self).await
+    }
+
+    async fn inspect_object(&self, object: &str) -> Result<Object> {
+        RhoClient::inspect_object(self, object).await
+    }
+
+    async fn runs(&self) -> Result<Vec<Run>> {
+        RhoClient::runs(self).await
+    }
+
+    async fn problems(&self) -> Result<Vec<Problem>> {
+        RhoClient::problems(self).await
+    }
+
+    async fn plots(&self) -> Result<Vec<Artifact>> {
+        RhoClient::plots(self).await
+    }
+}
+
 pub struct McpServer {
-    client: RhoClient,
+    backend: Arc<dyn McpBackend>,
     initialized: bool,
 }
 
 impl McpServer {
     pub fn new(server_url: &str) -> Result<Self> {
-        Ok(Self {
-            client: RhoClient::new(server_url)?,
+        Ok(Self::with_backend(RhoClient::new(server_url)?))
+    }
+
+    pub fn with_backend(backend: impl McpBackend + 'static) -> Self {
+        Self {
+            backend: Arc::new(backend),
             initialized: false,
-        })
+        }
     }
 
     pub async fn handle(&mut self, message: Value) -> Option<Value> {
@@ -103,8 +152,8 @@ impl McpServer {
     async fn call_tool(&self, name: &str, arguments: &Map<String, Value>) -> Result<Value> {
         match name {
             "workspace_open" => {
-                let workspace = self.client.status().await?;
-                let objects = self.client.objects().await?;
+                let workspace = self.backend.status().await?;
+                let objects = self.backend.objects().await?;
                 Ok(json!({
                     "workspace": workspace,
                     "objects": objects,
@@ -114,12 +163,12 @@ impl McpServer {
                     }
                 }))
             }
-            "workspace_status" => Ok(serde_json::to_value(self.client.status().await?)?),
+            "workspace_status" => Ok(serde_json::to_value(self.backend.status().await?)?),
             "workspace_execute" => {
                 let code = required_string(arguments, "code")?;
                 Ok(serde_json::to_value(
-                    self.client
-                        .execute(&ExecuteRunRequest {
+                    self.backend
+                        .execute(ExecuteRunRequest {
                             code,
                             source_path: optional_string(arguments, "source_path")?,
                             execution_mode: optional_string(arguments, "execution_mode")?,
@@ -139,14 +188,14 @@ impl McpServer {
             "object_inspect" => {
                 let object = required_string(arguments, "object")?;
                 Ok(serde_json::to_value(
-                    self.client.inspect_object(&object).await?,
+                    self.backend.inspect_object(&object).await?,
                 )?)
             }
-            "run_history" => Ok(serde_json::to_value(self.client.runs().await?)?),
-            "problem_list" => Ok(serde_json::to_value(self.client.problems().await?)?),
+            "run_history" => Ok(serde_json::to_value(self.backend.runs().await?)?),
+            "problem_list" => Ok(serde_json::to_value(self.backend.problems().await?)?),
             "artifact_export" => {
                 let artifact_id = required_string(arguments, "artifact_id")?;
-                let artifacts = self.client.plots().await?;
+                let artifacts = self.backend.plots().await?;
                 Ok(serde_json::to_value(
                     artifacts
                         .into_iter()
@@ -156,7 +205,7 @@ impl McpServer {
             }
             "plot_view" => {
                 let plot_id = required_string(arguments, "plot_id")?;
-                let plots = self.client.plots().await?;
+                let plots = self.backend.plots().await?;
                 Ok(serde_json::to_value(
                     plots
                         .into_iter()

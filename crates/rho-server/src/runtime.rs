@@ -6,10 +6,12 @@ use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use rho_core::ExecutionOrigin;
 use rho_protocol::{
-    ClientKind, ClientSession, DeepLink, Envelope, ExecuteRunRequest, MessageKind,
-    Object as ProtocolObject, OperationClass, RuntimeEvent, RuntimeEventKind, Workspace,
-    WorkspaceIdentity, WorkspaceLifecycle,
+    ClientKind, ClientSession, DeepLink, DependencyIssue, DependencyPhase, DependencyReport,
+    DependencyStatus, Envelope, ExecuteRunRequest, MessageKind, Object as ProtocolObject,
+    OperationClass, RuntimeEvent, RuntimeEventKind, Workspace, WorkspaceIdentity,
+    WorkspaceLifecycle,
 };
+use rho_runtime_deps::{DependencyManager, EnsureOptions};
 use rho_store::{
     ApprovalRequestSummary, PlotArtifactSummary, ProblemSummary, RunDetail, RunSummary, Store,
     StoredEvent,
@@ -64,6 +66,8 @@ struct RuntimeServiceInner {
     store: Mutex<Store>,
     mutations: Mutex<()>,
     execution_gate: Mutex<()>,
+    dependency_start_gate: Mutex<()>,
+    dependency_manager: RwLock<Option<DependencyManager>>,
     executor: RwLock<Option<Arc<dyn WorkspaceExecutor>>>,
     object_snapshot: RwLock<Option<ObjectSnapshot>>,
     events: broadcast::Sender<RuntimeEvent>,
@@ -134,6 +138,16 @@ impl RuntimeService {
         if let Some(project_root) = config.project_root.as_deref() {
             workspace.project_root = Some(normalized_path(project_root));
         }
+        if matches!(
+            workspace.lifecycle,
+            WorkspaceLifecycle::Starting
+                | WorkspaceLifecycle::Ready
+                | WorkspaceLifecycle::Busy
+                | WorkspaceLifecycle::Restarting
+        ) {
+            workspace.lifecycle = WorkspaceLifecycle::Disconnected;
+            workspace.updated_at = Utc::now().to_rfc3339();
+        }
         workspace.deep_link = DeepLink::workspace(&workspace.workspace_id)?;
         store.save_workspace(&workspace)?;
 
@@ -146,6 +160,8 @@ impl RuntimeService {
                 store: Mutex::new(store),
                 mutations: Mutex::new(()),
                 execution_gate: Mutex::new(()),
+                dependency_start_gate: Mutex::new(()),
+                dependency_manager: RwLock::new(None),
                 executor: RwLock::new(None),
                 object_snapshot: RwLock::new(None),
                 events,
@@ -159,6 +175,81 @@ impl RuntimeService {
 
     pub async fn has_executor(&self) -> bool {
         self.inner.executor.read().await.is_some()
+    }
+
+    pub async fn set_dependency_manager(&self, manager: DependencyManager) {
+        *self.inner.dependency_manager.write().await = Some(manager);
+    }
+
+    pub async fn dependency_manager(&self) -> Option<DependencyManager> {
+        self.inner.dependency_manager.read().await.clone()
+    }
+
+    pub async fn dependency_report(&self) -> DependencyReport {
+        if let Some(manager) = self.dependency_manager().await {
+            return manager.current_report().await;
+        }
+        DependencyReport {
+            schema_version: "1".to_string(),
+            revision: 0,
+            status: DependencyStatus::ActionRequired,
+            ready: false,
+            phase: DependencyPhase::Idle,
+            managed_by: "rho".to_string(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            components: Vec::new(),
+            issue: Some(DependencyIssue {
+                code: "dependency.manager_not_configured".to_string(),
+                title: "Runtime dependencies are not managed".to_string(),
+                message: "This control plane was started without a project dependency manager."
+                    .to_string(),
+                retryable: false,
+                requires_user_action: true,
+                action_url: Some("rho://setup/dependencies".to_string()),
+            }),
+            available_actions: Vec::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub async fn ensure_managed_workspace(
+        &self,
+        options: EnsureOptions,
+    ) -> Result<Option<Workspace>> {
+        let _startup = self.inner.dependency_start_gate.lock().await;
+        if self.has_executor().await {
+            return Ok(Some(self.workspace().await));
+        }
+        let manager = self
+            .dependency_manager()
+            .await
+            .context("Rho Dependency Manager is not configured")?;
+        let prepared = match manager.ensure(options).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.set_lifecycle(WorkspaceLifecycle::Failed).await?;
+                self.emit_dependency_status().await?;
+                return Err(error);
+            }
+        };
+        self.emit_dependency_status().await?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        self.start_ark(prepared.kernelspec_path, prepared.bridge_package)
+            .await
+            .map(Some)
+    }
+
+    pub async fn emit_dependency_status(&self) -> Result<()> {
+        let report = self.dependency_report().await;
+        self.append_runtime_event(
+            RuntimeEventKind::DependencyStatusChanged,
+            serde_json::to_value(report)?,
+            Some(self.workspace().await.deep_link),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn attach_executor(&self, executor: Arc<dyn WorkspaceExecutor>) -> Result<Workspace> {
@@ -722,6 +813,36 @@ mod tests {
         assert_eq!(second.identity, first.identity);
         assert_eq!(second.created_at, first.created_at);
         assert_eq!(second.project_root, first.project_root);
+    }
+
+    #[tokio::test]
+    async fn reopening_without_an_executor_normalizes_active_lifecycles() {
+        let directory = TempDir::new().unwrap();
+        for (index, lifecycle) in [
+            WorkspaceLifecycle::Starting,
+            WorkspaceLifecycle::Ready,
+            WorkspaceLifecycle::Busy,
+            WorkspaceLifecycle::Restarting,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store_path = directory.path().join(format!("runtime-{index}.sqlite"));
+            let service = RuntimeService::open(
+                RuntimeServiceConfig::new(&store_path)
+                    .with_workspace_id(format!("ws_recovery_{index}")),
+            )
+            .unwrap();
+            service.set_lifecycle(lifecycle).await.unwrap();
+            drop(service);
+
+            let reopened = RuntimeService::open(RuntimeServiceConfig::new(&store_path)).unwrap();
+            assert_eq!(
+                reopened.workspace().await.lifecycle,
+                WorkspaceLifecycle::Disconnected
+            );
+            assert!(!reopened.has_executor().await);
+        }
     }
 
     #[tokio::test]

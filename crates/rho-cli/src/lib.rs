@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, Response, Url};
 use rho_protocol::{
     ApiError, ApiResponse, Artifact, ExecuteRunRequest, Object, Problem, Provenance, Run,
-    WORKBENCH_PROTOCOL_VERSION, Workspace,
+    RuntimeHealth, WORKBENCH_PROTOCOL_VERSION, Workspace,
 };
 use serde::de::DeserializeOwned;
 
@@ -34,6 +34,10 @@ impl RhoClient {
     pub async fn status(&self) -> Result<Workspace> {
         self.get(self.endpoint(&["v1", "workspaces", "current"])?)
             .await
+    }
+
+    pub async fn health(&self) -> Result<RuntimeHealth> {
+        self.get(self.endpoint(&["healthz"])?).await
     }
 
     pub async fn execute(&self, request: &ExecuteRunRequest) -> Result<Run> {
@@ -165,6 +169,10 @@ mod tests {
         let client = RhoClient::new(&format!("http://{address}")).unwrap();
 
         assert_eq!(client.status().await.unwrap().workspace_id, "ws_cli");
+        let health = client.health().await.unwrap();
+        assert_eq!(health.workspace_id, "ws_cli");
+        assert!(health.control_plane_ready);
+        assert!(!health.workspace_r_ready);
         assert!(client.objects().await.unwrap().is_empty());
         assert!(client.problems().await.unwrap().is_empty());
         assert!(client.plots().await.unwrap().is_empty());

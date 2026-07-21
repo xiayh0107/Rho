@@ -194,6 +194,7 @@ pub struct Provenance {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeEventKind {
+    DependencyStatusChanged,
     WorkspaceLifecycleChanged,
     WorkspaceUpdated,
     RunStarted,
@@ -205,6 +206,141 @@ pub enum RuntimeEventKind {
     ApprovalRequested,
     ApprovalResolved,
     ProvenanceChanged,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyStatus {
+    #[default]
+    Checking,
+    ActionRequired,
+    Preparing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyPhase {
+    #[default]
+    Idle,
+    Discovering,
+    Downloading,
+    Verifying,
+    Installing,
+    GeneratingKernelspec,
+    SmokeTesting,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyComponentStatus {
+    Missing,
+    CandidateFound,
+    Incompatible,
+    Downloading,
+    Verifying,
+    Installing,
+    Ready,
+    Invalid,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencySource {
+    Explicit,
+    System,
+    Managed,
+    Bundled,
+    Downloaded,
+    Embedded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencyComponent {
+    pub name: String,
+    pub status: DependencyComponentStatus,
+    pub requirement: Option<String>,
+    pub version: Option<String>,
+    pub source: Option<DependencySource>,
+    pub path: Option<String>,
+    pub verified: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencyAction {
+    pub id: String,
+    pub label: String,
+    pub requires_human: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencyIssue {
+    pub code: String,
+    pub title: String,
+    pub message: String,
+    pub retryable: bool,
+    pub requires_user_action: bool,
+    pub action_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencyReport {
+    pub schema_version: String,
+    pub revision: u64,
+    pub status: DependencyStatus,
+    pub ready: bool,
+    pub phase: DependencyPhase,
+    pub managed_by: String,
+    pub platform: String,
+    pub components: Vec<DependencyComponent>,
+    pub issue: Option<DependencyIssue>,
+    pub available_actions: Vec<DependencyAction>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencySummary {
+    pub ready: bool,
+    pub status: DependencyStatus,
+    pub phase: DependencyPhase,
+    pub issue_code: Option<String>,
+    pub requires_user_action: bool,
+    pub action_url: Option<String>,
+}
+
+impl Default for DependencySummary {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            status: DependencyStatus::Checking,
+            phase: DependencyPhase::Idle,
+            issue_code: None,
+            requires_user_action: false,
+            action_url: None,
+        }
+    }
+}
+
+impl From<&DependencyReport> for DependencySummary {
+    fn from(report: &DependencyReport) -> Self {
+        Self {
+            ready: report.ready,
+            status: report.status,
+            phase: report.phase,
+            issue_code: report.issue.as_ref().map(|issue| issue.code.clone()),
+            requires_user_action: report
+                .issue
+                .as_ref()
+                .is_some_and(|issue| issue.requires_user_action),
+            action_url: report
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.action_url.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -221,9 +357,23 @@ pub struct RuntimeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct RuntimeHealth {
     pub status: String,
+    #[serde(default = "control_plane_ready_default")]
+    pub control_plane_ready: bool,
     pub workspace_id: String,
+    #[serde(default)]
+    pub project_root: Option<String>,
     pub lifecycle: WorkspaceLifecycle,
+    #[serde(default)]
+    pub executor_attached: bool,
+    #[serde(default)]
+    pub workspace_r_ready: bool,
+    #[serde(default)]
+    pub dependencies: DependencySummary,
     pub connected_clients: usize,
+}
+
+fn control_plane_ready_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -367,6 +517,8 @@ pub fn workbench_protocol_schema() -> Value {
             "event_page": schema_for!(EventPage),
             "event_stream_message": schema_for!(EventStreamMessage),
             "runtime_health": schema_for!(RuntimeHealth),
+            "dependency_report": schema_for!(DependencyReport),
+            "dependency_summary": schema_for!(DependencySummary),
             "client_session": schema_for!(ClientSession),
             "api_error": schema_for!(ApiError),
             "execute_run_request": schema_for!(ExecuteRunRequest)
@@ -392,6 +544,9 @@ mod tests {
             "approval",
             "provenance",
             "runtime_event",
+            "runtime_health",
+            "dependency_report",
+            "dependency_summary",
         ] {
             assert!(entities.contains_key(name), "missing {name} schema");
         }
@@ -414,6 +569,23 @@ mod tests {
         assert_eq!(value["lifecycle"], "ready");
         assert!(value.get("connection_id").is_none());
         assert!(value.get("client_kind").is_none());
+    }
+
+    #[test]
+    fn runtime_health_additions_accept_legacy_payloads() {
+        let health: RuntimeHealth = serde_json::from_value(json!({
+            "status": "ok",
+            "workspace_id": "ws_test",
+            "lifecycle": "disconnected",
+            "connected_clients": 0
+        }))
+        .unwrap();
+        assert!(health.control_plane_ready);
+        assert_eq!(health.project_root, None);
+        assert!(!health.executor_attached);
+        assert!(!health.workspace_r_ready);
+        assert!(!health.dependencies.ready);
+        assert_eq!(health.dependencies.status, DependencyStatus::Checking);
     }
 
     #[test]

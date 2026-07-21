@@ -1,3 +1,4 @@
+<!-- BEGIN RHO SCIENTIFIC RUNTIME CONTRACT -->
 # Rho scientific runtime contract
 
 This project uses Rho as the source of truth for R state.
@@ -17,3 +18,4 @@ This project uses Rho as the source of truth for R state.
 Common R project markers are `.Rproj`, `DESCRIPTION`, `renv.lock`, `.Rprofile`, and `R/`. Their presence helps discovery but does not replace the workspace identity returned by Rho.
 
 The Agent shell's current directory is not Rho workspace identity. Use absolute project/script paths and the project root plus workspace ID reported by Rho.
+<!-- END RHO SCIENTIFIC RUNTIME CONTRACT -->

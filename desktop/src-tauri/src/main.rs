@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use rho_runtime_deps::{DependencyManager, EnsureOptions};
 use rho_server::runtime::{RuntimeService, RuntimeServiceConfig};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -56,6 +57,11 @@ fn setup(app: &mut tauri::App, launch: &LaunchOptions) -> Result<()> {
     let runtime = RuntimeService::open(
         RuntimeServiceConfig::new(store_path).with_project_root(project_root.clone()),
     )?;
+    let mut dependencies = DependencyManager::new(&project_root)?;
+    if let Some(bundled_ark) = resolve_bundled_ark(app)? {
+        dependencies = dependencies.with_bundled_ark(bundled_ark);
+    }
+    tauri::async_runtime::block_on(runtime.set_dependency_manager(dependencies.clone()));
     let listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind((
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         0,
@@ -70,26 +76,46 @@ fn setup(app: &mut tauri::App, launch: &LaunchOptions) -> Result<()> {
         }
     });
 
-    if let Some(kernelspec) = launch.kernelspec.clone() {
+    let explicit_start = launch.kernelspec.clone().map(|kernelspec| {
         let bridge_package = resolve_bridge_package(app, launch.bridge_package.as_deref())?;
-        let runtime = runtime.clone();
-        let app_handle = app.handle().clone();
-        tauri::async_runtime::spawn(async move {
-            let message = match runtime.start_ark(kernelspec, bridge_package).await {
-                Ok(_) => "Workspace R is connected.".to_string(),
-                Err(error) => {
-                    eprintln!("rho-desktop could not attach Workspace R: {error:#}");
-                    format!("The control plane started, but Workspace R could not connect: {error}")
-                }
-            };
-            let _ = app_handle
-                .notification()
-                .builder()
-                .title("Rho")
-                .body(message)
-                .show();
-        });
-    }
+        Ok::<_, anyhow::Error>((kernelspec, bridge_package))
+    });
+    let runtime_start = runtime.clone();
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let result = match explicit_start.transpose() {
+            Ok(Some((kernelspec, bridge_package))) => runtime_start
+                .start_ark(kernelspec, bridge_package)
+                .await
+                .map(Some),
+            Ok(None) => {
+                runtime_start
+                    .ensure_managed_workspace(EnsureOptions::default())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let message = match result {
+            Ok(Some(_)) => "Workspace R is connected.".to_string(),
+            Ok(None) => {
+                let report = runtime_start.dependency_report().await;
+                report.issue.map_or_else(
+                    || "Workspace R is waiting for runtime dependencies.".to_string(),
+                    |issue| issue.message,
+                )
+            }
+            Err(error) => {
+                eprintln!("rho-desktop could not prepare Workspace R: {error:#}");
+                format!("Workspace R could not start: {error}")
+            }
+        };
+        let _ = app_handle
+            .notification()
+            .builder()
+            .title("Rho")
+            .body(message)
+            .show();
+    });
 
     build_window(app, address, &runtime_url)?;
     build_tray(app)?;
@@ -169,6 +195,26 @@ fn resolve_bridge_package(app: &tauri::App, explicit: Option<&Path>) -> Result<P
         .into_iter()
         .find(|path| path.is_dir())
         .context("rho.bridge was not found; set RHO_BRIDGE_PACKAGE")
+}
+
+fn resolve_bundled_ark(app: &tauri::App) -> Result<Option<PathBuf>> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .context("resolving Rho resource directory")?;
+    let candidate = bundled_ark_resource_path(&resource_dir);
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(candidate.canonicalize().with_context(|| {
+        format!("resolving bundled Ark at {}", candidate.display())
+    })?))
+}
+
+fn bundled_ark_resource_path(resource_dir: &Path) -> PathBuf {
+    resource_dir
+        .join("resources/runtime")
+        .join(if cfg!(windows) { "ark.exe" } else { "ark" })
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {
@@ -270,5 +316,15 @@ mod tests {
             &"https://example.com/".parse().unwrap(),
             address
         ));
+    }
+
+    #[test]
+    fn packaged_ark_uses_the_tauri_runtime_resource_layout() {
+        let resource_dir = Path::new("/application/resources");
+        let expected_name = if cfg!(windows) { "ark.exe" } else { "ark" };
+        assert_eq!(
+            bundled_ark_resource_path(resource_dir),
+            resource_dir.join("resources/runtime").join(expected_name)
+        );
     }
 }

@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "rho": {
-      "command": "rho-mcp",
-      "args": [
-        "--server",
-        "${RHO_SERVER_URL:-http://127.0.0.1:8787}"
-      ]
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp"
     }
   }
 }

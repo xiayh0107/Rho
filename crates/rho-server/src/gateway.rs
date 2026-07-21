@@ -61,6 +61,19 @@ pub fn router(state: GatewayState) -> Router {
         .route("/", get(web_index))
         .route("/app.js", get(web_javascript))
         .route("/styles.css", get(web_styles))
+        .route("/agent-setup.md", get(agent_setup))
+        .route(
+            "/agent/skills/operate-rho-runtime/SKILL.md",
+            get(agent_skill),
+        )
+        .route(
+            "/agent/skills/operate-rho-runtime/agents/openai.yaml",
+            get(agent_skill_metadata),
+        )
+        .route(
+            "/agent/skills/operate-rho-runtime/references/workbench-protocol.md",
+            get(agent_skill_protocol),
+        )
         .route(
             "/v1/workspaces/{workspace_id}/events/ws",
             get(proxy_websocket),
@@ -90,6 +103,36 @@ async fn web_styles() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../../../web/styles.css"),
+    )
+}
+
+async fn agent_setup() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../../docs/agent-setup.md"),
+    )
+}
+
+async fn agent_skill() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../../.agents/skills/operate-rho-runtime/SKILL.md"),
+    )
+}
+
+async fn agent_skill_metadata() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        include_str!("../../../.agents/skills/operate-rho-runtime/agents/openai.yaml"),
+    )
+}
+
+async fn agent_skill_protocol() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!(
+            "../../../.agents/skills/operate-rho-runtime/references/workbench-protocol.md"
+        ),
     )
 }
 
@@ -283,6 +326,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(workspace["data"]["workspace_id"], "ws_remote");
+
+        let setup = reqwest::get(format!("http://{gateway_address}/agent-setup.md"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(setup.contains("# Connect an Agent to Rho"));
 
         let (mut socket, _) = connect_async(format!(
             "ws://{gateway_address}/v1/workspaces/ws_remote/events/ws?client=web"

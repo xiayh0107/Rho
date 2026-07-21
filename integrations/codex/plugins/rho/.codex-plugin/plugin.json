@@ -1,0 +1,29 @@
+{
+  "name": "rho",
+  "version": "0.2.0-dev.2",
+  "description": "Connect Codex to Rho's trusted scientific runtime for R workspaces, objects, runs, plots, problems, approvals, and provenance.",
+  "author": {
+    "name": "Rho contributors",
+    "url": "https://github.com/xiayh0107/Rho"
+  },
+  "homepage": "https://github.com/xiayh0107/Rho",
+  "repository": "https://github.com/xiayh0107/Rho",
+  "license": "MIT",
+  "keywords": ["r", "science", "runtime", "mcp", "provenance"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Rho Scientific Runtime",
+    "shortDescription": "Trusted scientific R workspaces",
+    "longDescription": "Use Codex for reasoning while Rho owns persistent R state, safe execution, semantic object inspection, artifacts, and provenance.",
+    "developerName": "Rho contributors",
+    "category": "Developer",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/xiayh0107/Rho",
+    "defaultPrompt": [
+      "Connect this project to Rho and inspect its scientific workspace",
+      "Run this R analysis in Rho and report provenance"
+    ],
+    "brandColor": "#B8F56A"
+  },
+  "mcpServers": "./.mcp.json"
+}

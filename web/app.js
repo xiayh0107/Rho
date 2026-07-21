@@ -7,7 +7,7 @@ const views = {
   provenance: ["Provenance", "How code, objects, results, and artifacts relate."],
 };
 
-const state = { workspace: null, active: "runs", socket: null, refreshTimer: null };
+const state = { workspace: null, dependencies: null, active: "runs", socket: null, refreshTimer: null, runtimeTimer: null, controlPlane: "connecting", inspection: null };
 const content = document.querySelector("#view-content");
 const summary = document.querySelector("#runtime-summary");
 const title = document.querySelector("#view-title");
@@ -15,15 +15,29 @@ const description = document.querySelector("#view-description");
 const label = document.querySelector("#workspace-label");
 const dot = document.querySelector("#connection-dot");
 const toast = document.querySelector("#toast");
+const setupDialog = document.querySelector("#agent-setup-dialog");
+const setupPrompt = document.querySelector("#agent-setup-prompt");
+const copySetupLabel = document.querySelector("#copy-agent-setup-label");
+const setupControlPlane = document.querySelector("#setup-control-plane");
+const setupRuntimeUrl = document.querySelector("#setup-runtime-url");
+const setupWorkspaceStatus = document.querySelector("#setup-workspace-status");
+const setupWorkspaceMeaning = document.querySelector("#setup-workspace-meaning");
+const codexHandoff = document.querySelector("#codex-handoff");
+const dependencyBanner = document.querySelector("#dependency-banner");
 
 const escapeHtml = (value) => String(value ?? "")
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 const displayTime = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "—";
 const asList = (value) => Array.isArray(value) ? value : [];
+const shellQuote = (value) => `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 
-async function api(path) {
-  const response = await fetch(path, { headers: { accept: "application/json" } });
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    method: options.method || "GET",
+    headers: { accept: "application/json", ...(options.body ? { "content-type": "application/json" } : {}) },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.message || `Request failed (${response.status})`);
   return payload.data;
@@ -35,11 +49,138 @@ function showToast(message) {
   window.setTimeout(() => toast.classList.remove("show"), 2600);
 }
 
+function buildAgentSetupPrompt() {
+  const setupUrl = new URL("/agent-setup.md", window.location.href).href;
+  const runtimeUrl = window.location.origin;
+  const projectRoot = state.workspace?.project_root || "PROJECT_ROOT";
+  return `Read ${setupUrl} and follow it exactly once to install Rho's official skill for this Agent in the project at ${JSON.stringify(projectRoot)} and connect it to the Rho runtime at ${runtimeUrl}.`;
+}
+
+function lifecycleMeaning(lifecycle) {
+  const meanings = {
+    starting: "Rho is preparing and starting the managed R/Ark runtime",
+    ready: "Ark/R kernel is attached and ready",
+    busy: "Ark/R kernel is executing work",
+    restarting: "Ark/R kernel is restarting",
+    disconnected: "Workspace R is not attached; inspect dependency status below",
+    failed: "Ark/R kernel failed; the control plane may still be online",
+  };
+  return meanings[lifecycle] || "Kernel readiness, not Agent registration";
+}
+
+function dependencyStatusMeaning(report) {
+  if (!report) return "Checking R, Ark, and the workspace binding";
+  if (report.ready && !["ready", "busy"].includes(state.workspace?.lifecycle)) {
+    return "R, Ark, the controlled binding, and rho.bridge are ready; Workspace R can now be started";
+  }
+  if (report.ready) return "R, Ark, the controlled binding, and rho.bridge are ready";
+  if (report.issue?.message) return report.issue.message;
+  const phases = {
+    discovering: "Discovering compatible R and cached runtime components",
+    downloading: "Downloading a checksum-pinned runtime component",
+    verifying: "Verifying the downloaded artifact",
+    installing: "Publishing runtime components atomically",
+    generating_kernelspec: "Generating the controlled Workspace R binding",
+    smoke_testing: "Verifying Workspace R",
+  };
+  return phases[report.phase] || "Runtime dependencies are not ready";
+}
+
+function renderDependencyBanner() {
+  const report = state.dependencies;
+  if (!report) return;
+  dependencyBanner.className = `dependency-banner ${escapeHtml(report.status)}`;
+  const components = asList(report.components).map((component) => `
+    <span class="dependency-component ${escapeHtml(component.status)}">
+      <b>${escapeHtml(component.name)}</b>
+      <span>${escapeHtml(component.version || component.status)}</span>
+    </span>`).join("");
+  const availableActions = [...asList(report.available_actions)];
+  if (report.ready && !["ready", "busy"].includes(state.workspace?.lifecycle)
+      && !availableActions.some((action) => action.id === "ensure")) {
+    availableActions.push({ id: "ensure", label: "Start Workspace R", requires_human: false });
+  }
+  const actions = availableActions.map((action) => `
+    <button type="button" data-dependency-action="${escapeHtml(action.id)}" data-requires-human="${action.requires_human ? "true" : "false"}">
+      ${escapeHtml(action.label)}
+    </button>`).join("");
+  dependencyBanner.innerHTML = `
+    <div class="dependency-copy">
+      <span class="dependency-kicker">Runtime dependencies · ${escapeHtml(report.phase)}</span>
+      <strong>${report.ready && ["ready", "busy"].includes(state.workspace?.lifecycle) ? "Workspace runtime ready" : report.ready ? "Runtime dependencies ready" : escapeHtml(report.issue?.title || report.status)}</strong>
+      <small>${escapeHtml(dependencyStatusMeaning(report))}</small>
+      <div class="dependency-components">${components}</div>
+    </div>
+    ${actions ? `<div class="dependency-actions">${actions}</div>` : ""}`;
+}
+
+async function runDependencyAction(action, requiresHuman) {
+  if (requiresHuman && !window.confirm("This action changes a Rho-managed runtime component. Continue?")) return;
+  const button = [...dependencyBanner.querySelectorAll("[data-dependency-action]")]
+    .find((candidate) => candidate.dataset.dependencyAction === action);
+  if (button) { button.disabled = true; button.textContent = "Working…"; }
+  try {
+    state.dependencies = await api("/v1/runtime/dependencies", {
+      method: "POST",
+      body: { action, confirmed: requiresHuman },
+    });
+    renderDependencyBanner();
+    await refreshRuntimeState();
+    showToast(state.dependencies.ready ? "Workspace R is ready" : dependencyStatusMeaning(state.dependencies));
+  } catch (error) {
+    showToast(error.message);
+    await refreshRuntimeState();
+  }
+}
+
+function renderAgentSetupContext() {
+  const runtimeUrl = window.location.origin;
+  const projectRoot = state.workspace?.project_root || "PROJECT_ROOT";
+  const lifecycle = state.workspace?.lifecycle;
+  setupControlPlane.textContent = state.controlPlane;
+  setupControlPlane.classList.toggle("warning", state.controlPlane !== "online");
+  setupRuntimeUrl.textContent = runtimeUrl;
+  setupWorkspaceStatus.textContent = lifecycle || "Unavailable";
+  setupWorkspaceStatus.className = lifecycle ? `lifecycle-${lifecycle}` : "warning";
+  setupWorkspaceMeaning.textContent = state.dependencies?.ready
+    ? lifecycleMeaning(lifecycle)
+    : dependencyStatusMeaning(state.dependencies);
+  codexHandoff.textContent = `codex -C ${shellQuote(projectRoot)}`;
+}
+
+function openAgentSetup() {
+  renderAgentSetupContext();
+  setupPrompt.textContent = buildAgentSetupPrompt();
+  copySetupLabel.textContent = "Copy one-sentence setup";
+  setupDialog.showModal();
+}
+
+async function copyAgentSetup() {
+  const prompt = buildAgentSetupPrompt();
+  setupPrompt.textContent = prompt;
+  try {
+    await navigator.clipboard.writeText(prompt);
+  } catch (_) {
+    const field = document.createElement("textarea");
+    field.value = prompt;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.append(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+  }
+  copySetupLabel.textContent = "Copied — paste into your Agent";
+  showToast("Agent setup prompt copied");
+}
+
 function renderSummary() {
   const ws = state.workspace;
   if (!ws) return;
   const metrics = [
-    ["Lifecycle", ws.lifecycle, "Workspace R"],
+    ["Lifecycle", ws.lifecycle, lifecycleMeaning(ws.lifecycle)],
+    ["Dependencies", state.dependencies?.status || "checking", state.dependencies?.phase || "discovering"],
     ["State revision", ws.identity.state_revision, `Execution ${ws.identity.execution_seq}`],
     ["Project revision", ws.identity.project_revision, ws.project_root || "No project root"],
     ["Kernel identity", ws.identity.kernel_instance_id, ws.workspace_id],
@@ -50,6 +191,23 @@ function renderSummary() {
       <strong class="metric-value">${escapeHtml(value)}</strong>
       <span class="metric-detail truncate">${escapeHtml(detail)}</span>
     </article>`).join("");
+}
+
+async function refreshRuntimeState() {
+  const [workspace, dependencies] = await Promise.all([
+    api("/v1/workspaces/current"),
+    api("/v1/runtime/dependencies"),
+  ]);
+  state.workspace = workspace;
+  state.dependencies = dependencies;
+  label.textContent = `Control plane online · R ${workspace.lifecycle}`;
+  renderSummary();
+  renderDependencyBanner();
+  if (setupDialog.open) renderAgentSetupContext();
+  window.clearTimeout(state.runtimeTimer);
+  if (!dependencies.ready || !["ready", "busy"].includes(workspace.lifecycle)) {
+    state.runtimeTimer = window.setTimeout(() => refreshRuntimeState().catch(() => {}), 1000);
+  }
 }
 
 function panelHead(titleText, detail, count) {
@@ -75,20 +233,29 @@ async function renderRuns() {
 }
 
 async function inspectObject(objectId) {
-  const target = document.querySelector("#inspection");
-  if (!target) return;
-  target.innerHTML = `<div class="loading-state"><span></span>Inspecting live object…</div>`;
+  const initialTarget = document.querySelector("#inspection");
+  if (!initialTarget) return;
+  initialTarget.innerHTML = `<div class="loading-state"><span></span>Inspecting live object…</div>`;
   try {
     const object = await api(`/v1/workspaces/${encodeURIComponent(state.workspace.workspace_id)}/objects/${encodeURIComponent(objectId)}`);
-    target.innerHTML = `<div class="inspection"><span class="card-kicker">Bounded inspection</span><h3>${escapeHtml(object.name)}</h3><pre>${escapeHtml(JSON.stringify(object.metadata, null, 2))}</pre></div>`;
+    state.inspection = object;
+    const currentTarget = document.querySelector("#inspection");
+    if (currentTarget) currentTarget.innerHTML = renderInspection(object);
   } catch (error) {
-    target.innerHTML = `<div class="error-state"><div><strong>Inspection failed</strong>${escapeHtml(error.message)}</div></div>`;
+    const currentTarget = document.querySelector("#inspection");
+    if (currentTarget) currentTarget.innerHTML = `<div class="error-state"><div><strong>Inspection failed</strong>${escapeHtml(error.message)}</div></div>`;
   }
+}
+
+function renderInspection(object) {
+  if (!object) return "";
+  return `<div class="inspection"><span class="card-kicker">Bounded inspection</span><h3>${escapeHtml(object.name)}</h3><pre>${escapeHtml(JSON.stringify(object.metadata, null, 2))}</pre></div>`;
 }
 
 async function renderObjects() {
   const objects = await api(`/v1/workspaces/${encodeURIComponent(state.workspace.workspace_id)}/objects`);
   if (!objects.length) return emptyState("objects", "Start Workspace R and create an object; values remain in R and only bounded metadata is projected here.");
+  if (state.inspection && !objects.some((object) => object.object_id === state.inspection.object_id)) state.inspection = null;
   window.inspectRhoObject = inspectObject;
   return `${panelHead("Live environment", "Values stay in Workspace R · previews are bounded", objects.length)}<div class="card-grid">
     ${objects.map((object) => `<article class="object-card">
@@ -96,7 +263,7 @@ async function renderObjects() {
       <p class="object-meta">${object.dimensions.length ? `${object.dimensions.join(" × ")} dimensions` : "No dimensions"} · ${escapeHtml(object.metadata.preview_kind || "opaque")}</p>
       <div class="class-list">${asList(object.class).map((name) => `<span class="class-chip">${escapeHtml(name)}</span>`).join("")}</div>
       <button class="inspect-button" type="button" onclick="inspectRhoObject('${escapeHtml(object.object_id)}')">Inspect object</button>
-    </article>`).join("")}<div id="inspection"></div></div>`;
+    </article>`).join("")}<div id="inspection">${renderInspection(state.inspection)}</div></div>`;
 }
 
 function plotSource(plot) {
@@ -163,32 +330,59 @@ function connectEvents() {
   const id = encodeURIComponent(state.workspace.workspace_id);
   const socket = new WebSocket(`${scheme}://${location.host}/v1/workspaces/${id}/events/ws?client=web`);
   state.socket = socket;
-  socket.addEventListener("open", () => dot.classList.add("live"));
+  socket.addEventListener("open", () => {
+    state.controlPlane = "online";
+    dot.classList.add("live");
+    label.textContent = `Control plane online · R ${state.workspace.lifecycle}`;
+    refreshRuntimeState().catch(() => {});
+  });
   socket.addEventListener("message", () => {
     window.clearTimeout(state.refreshTimer);
-    state.refreshTimer = window.setTimeout(() => refreshView({ quiet: true }), 180);
+    state.refreshTimer = window.setTimeout(async () => {
+      await refreshRuntimeState().catch(() => {});
+      await refreshView({ quiet: true });
+    }, 180);
   });
-  socket.addEventListener("close", () => { dot.classList.remove("live"); window.setTimeout(connectEvents, 2000); });
+  socket.addEventListener("close", () => {
+    state.controlPlane = "reconnecting";
+    dot.classList.remove("live");
+    label.textContent = `Control plane reconnecting · R ${state.workspace.lifecycle}`;
+    window.setTimeout(connectEvents, 2000);
+  });
 }
 
 async function bootstrap() {
+  document.querySelector("#connect-agent-button").addEventListener("click", openAgentSetup);
+  document.querySelector("#copy-agent-setup").addEventListener("click", copyAgentSetup);
+  document.querySelector("#close-agent-setup").addEventListener("click", () => setupDialog.close());
+  setupDialog.addEventListener("click", (event) => {
+    if (event.target === setupDialog) setupDialog.close();
+  });
+  dependencyBanner.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-dependency-action]");
+    if (button) runDependencyAction(button.dataset.dependencyAction, button.dataset.requiresHuman === "true");
+  });
   document.querySelector("#workspace-nav").addEventListener("click", (event) => {
     const button = event.target.closest("[data-view]");
     if (button) selectView(button.dataset.view);
   });
   document.querySelector("#refresh-button").addEventListener("click", async () => {
-    await refreshView(); showToast("Scientific state refreshed");
+    await refreshRuntimeState();
+    await refreshView();
+    showToast("Runtime and scientific state refreshed");
   });
   try {
-    state.workspace = await api("/v1/workspaces/current");
-    label.textContent = `${state.workspace.workspace_id} · ${state.workspace.lifecycle}`;
-    dot.classList.toggle("live", state.workspace.lifecycle !== "disconnected" && state.workspace.lifecycle !== "failed");
-    dot.classList.toggle("error", state.workspace.lifecycle === "failed");
+    await refreshRuntimeState();
+    state.controlPlane = "online";
+    label.textContent = `Control plane online · R ${state.workspace.lifecycle}`;
+    dot.classList.add("live");
+    dot.classList.remove("error");
     renderSummary();
     const initial = location.hash.slice(1);
     selectView(views[initial] ? initial : "runs");
     connectEvents();
   } catch (error) {
+    state.controlPlane = "unavailable";
     dot.classList.add("error"); label.textContent = "Runtime unavailable";
     content.innerHTML = `<div class="error-state"><div><strong>Cannot reach Rho</strong>${escapeHtml(error.message)}</div></div>`;
   }

@@ -18,12 +18,17 @@ Jupyter Server, JupyterLab or Electron.
 
 - `scripts/build-windows-installer.ps1` is the authority for the release build
   target and machine-local tool paths.
-- `scripts/bootstrap-ark-windows.ps1` is the authority for acquiring Ark and
-  generating its controlled kernelspec.
-- `runtime/ark.json` is the authority for the Ark version, URL and checksum.
+- `runtime/dependencies.json` is the authority for supported R versions and
+  the Ark version, release assets, sizes and checksums.
+- `rho deps` and the `rho-runtime-deps` crate are the authority for dependency
+  discovery, verification, shared caching and controlled project bindings.
+- `scripts/bootstrap-ark-windows.ps1` is a compatibility wrapper around
+  `rho deps ensure`; it does not download or expand Ark itself.
+- `runtime/ark.json` is retained as a deprecated compatibility manifest only.
 - `Cargo.lock` is the authority for Rust dependency versions.
-- Do not commit the Ark executable. It is downloaded into `.rho/runtime` and
-  copied into `desktop/resources/runtime` only for packaging.
+- Do not commit the Ark executable. The dependency manager publishes it to its
+  immutable cross-project cache and the installer build copies the verified
+  entry into `desktop/resources/runtime` only for packaging.
 - Do not modify or reinstall the `aisdk` family merely to make a build pass.
 - Do not automatically install the newly built Rho over a version the user is
   currently running.
@@ -101,16 +106,18 @@ interactive `rustup` default is the packaging target.
 
 A clean first build may require network access for:
 
+- the checksum-pinned official R installer when the user explicitly asks Rho
+  to prepare it;
 - the checksum-pinned Ark archive from the Posit Ark GitHub release;
 - Rust crates referenced by `Cargo.lock`;
 - checksum-resolved `@tauri-apps/cli@2.11.4` invoked through `npx`;
 - Tauri's NSIS bundling tools if they are not already cached.
 
-Ark is pinned exactly in `runtime/ark.json`:
+Ark is pinned exactly in `runtime/dependencies.json`:
 
 ```text
 version: 0.1.252
-sha256: A6C2C6AE931D0DD5E1F771243BF3DF4F86968462BBD8E08CEEBA7F2E53567E58
+sha256: a6c2c6ae931d0dd5e1f771243bf3df4f86968462bbd8e08ceeba7f2e53567e58
 ```
 
 The Tauri CLI is pinned to `2.11.4`. For a build report, record the resolved
@@ -125,29 +132,42 @@ From a fresh PowerShell session:
 Set-Location D:\Rho
 Rscript -e "cat(R.version.string, '\n'); cat(R.home(), '\n'); cat(paste(.libPaths(), collapse='\n'))"
 powershell -ExecutionPolicy Bypass -File scripts\bootstrap-ark-windows.ps1
+target\debug\rho.exe deps status --project D:\Rho --json
 ```
+
+If no compatible R is present, the report stays `action_required`. An explicit
+`rho deps ensure --project D:\Rho --install-r --json` prepares and verifies the
+official R installer, but the user must approve and run that operating-system
+installer before repeating bootstrap. The build script never elevates itself
+or asks an Agent to install R silently.
 
 The bootstrap script:
 
-1. resolves `R_HOME`, the R DLL directory and `.libPaths()` through the active
-   `Rscript`;
-2. downloads Ark only when the pinned executable is absent;
-3. verifies the archive SHA-256 before extraction;
-4. writes `.rho\runtime\ark-0.1.252\kernel.json` as UTF-8 without BOM;
-5. starts Ark with user, site and project startup files disabled;
-6. preserves the selected R home, package libraries and R DLL search path in
-   the generated kernelspec.
+1. delegates discovery and preparation to `rho deps ensure`;
+2. accepts only a compatible R discovered by Rho, including `RHO_RSCRIPT` when
+   explicitly configured;
+3. installs Ark into the shared Rho cache only after the pinned size and
+   SHA-256 checks pass;
+4. materializes the embedded `rho.bridge` package without requiring a separate
+   R package prerequisite;
+5. writes a controlled kernelspec under `.rho\runtime\bindings` with user,
+   site and project startup files disabled;
+6. verifies that the kernelspec references the Ark path from the dependency
+   report and prints that kernelspec path as its only result.
 
 The controlled startup is intentional. User or project `.Rprofile` files can
 break a headless Ark session and must not be re-enabled during packaging work.
 
-Expected bootstrap files:
+Use `rho deps cache-path --project D:\Rho --json` to resolve the machine-local
+cache root. Expected managed files are:
 
 ```text
-.rho\runtime\ark-0.1.252\ark.exe
-.rho\runtime\ark-0.1.252\kernel.json
-.rho\runtime\ark-0.1.252\LICENSE
-.rho\runtime\ark-0.1.252\NOTICE
+<rho-cache>\components\ark\0.1.252\windows-x64\ark.exe
+<rho-cache>\components\ark\0.1.252\windows-x64\LICENSE
+<rho-cache>\components\ark\0.1.252\windows-x64\NOTICE
+<rho-cache>\components\ark\0.1.252\windows-x64\rho-install.json
+.rho\runtime\bindings\r-<R-version>-ark-0.1.252-windows-x64\kernel.json
+.rho\runtime\bindings\r-<R-version>-ark-0.1.252-windows-x64\runtime.json
 ```
 
 ## Validation Before Packaging
@@ -189,11 +209,14 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1
 The script performs these steps:
 
 1. selects the GNU Rust toolchain and Rtools45 linker;
-2. requires the bootstrapped Ark runtime;
-3. copies `ark.exe`, `LICENSE` and `NOTICE` into the Tauri resource tree;
-4. runs `npx.cmd -y "@tauri-apps/cli@2.11.4" build` from
+2. runs `rho deps ensure` and requires a ready Windows x64 report;
+3. rejects Ark unless Rho marked it verified and its path is inside the Rho
+   dependency cache;
+4. copies `ark.exe`, `LICENSE`, `NOTICE` and the verification receipt into the
+   Tauri resource tree, then re-hashes every copy;
+5. runs `npx.cmd -y "@tauri-apps/cli@2.11.4" build` from
    `desktop\src-tauri`;
-5. creates the per-user x64 NSIS installer.
+6. creates the per-user x64 NSIS installer.
 
 Expected outputs:
 
@@ -219,7 +242,7 @@ change.
 The NSIS installer must contain or install:
 
 - `rho-desktop.exe`;
-- Ark `0.1.252` plus its license and notice;
+- Ark `0.1.252`, its license and notice, and Rho's verification receipt;
 - `WebView2Loader.dll` for the GNU Windows build;
 - the embedded HTML, CSS and JavaScript frontend.
 
@@ -269,8 +292,10 @@ an installer does not require automatically installing it.
 
 ### Ark runtime not found
 
-Run `scripts\bootstrap-ark-windows.ps1` and verify the pinned executable below
-`.rho\runtime\ark-0.1.252`.
+Run `rho deps status --project D:\Rho --json`. If Ark is missing, run
+`scripts\bootstrap-ark-windows.ps1`; if a cached entry fails verification, run
+`rho deps repair --project D:\Rho --json`. Do not copy an arbitrary `ark.exe`
+into `.rho` or the packaging resource directory.
 
 ### Wrong Rust linker or target
 
@@ -315,4 +340,3 @@ An implementation agent handing work back for review must provide:
 - known limitations;
 - an explicit statement that no aisdk family repository was changed, or a
   separately approved explanation if it was.
-
