@@ -37,6 +37,21 @@ bounded_vector <- function(values, limit = 8L) {
 }
 
 rho_preview_kind <- function(value) {
+  if (inherits(value, "Seurat")) {
+    return("single_cell")
+  }
+  if (inherits(value, "SingleCellExperiment")) {
+    return("single_cell_experiment")
+  }
+  if (inherits(value, "SummarizedExperiment")) {
+    return("summarized_experiment")
+  }
+  if (inherits(value, c("GRanges", "GenomicRanges"))) {
+    return("genomic_ranges")
+  }
+  if (inherits(value, "ggplot")) {
+    return("plot")
+  }
   if (is.data.frame(value)) {
     return("tabular")
   }
@@ -189,6 +204,101 @@ bounded_columns <- function(names, limit = 8L, max_chars = 128L) {
   if (is.null(x)) y else x
 }
 
+safe_dimensions <- function(value) {
+  tryCatch({
+    dimensions <- dim(value)
+    if (is.null(dimensions)) NULL else as.integer(dimensions)
+  }, error = function(e) NULL)
+}
+
+safe_slot <- function(value, name, default = NULL) {
+  tryCatch({
+    if (!methods::is(value, "classRepresentation") && methods::isS4(value) && name %in% methods::slotNames(value)) {
+      methods::slot(value, name)
+    } else {
+      default
+    }
+  }, error = function(e) default)
+}
+
+safe_exported_call <- function(package, name, value, default = NULL) {
+  tryCatch({
+    if (!requireNamespace(package, quietly = TRUE)) {
+      return(default)
+    }
+    function_value <- getExportedValue(package, name)
+    function_value(value)
+  }, error = function(e) default)
+}
+
+bounded_names <- function(value, limit = 12L) {
+  bounded_vector(names(value) %||% character(), limit = limit)
+}
+
+rho_semantic_metadata <- function(value, max_rows = 8L, max_cols = 8L) {
+  if (inherits(value, "Seurat")) {
+    assays <- safe_slot(value, "assays", list())
+    reductions <- safe_slot(value, "reductions", list())
+    metadata <- safe_slot(value, "meta.data", data.frame())
+    return(list(
+      kind = "seurat",
+      features = safe_dimensions(value)[1L] %||% NULL,
+      cells = safe_dimensions(value)[2L] %||% NULL,
+      assays = bounded_names(assays),
+      reductions = bounded_names(reductions),
+      metadata_columns = bounded_columns(names(metadata), max_cols)
+    ))
+  }
+  if (inherits(value, "SingleCellExperiment")) {
+    assay_names <- safe_exported_call("SummarizedExperiment", "assayNames", value, character())
+    reduced_names <- safe_exported_call("SingleCellExperiment", "reducedDimNames", value, character())
+    dimensions <- safe_dimensions(value)
+    return(list(
+      kind = "single_cell_experiment",
+      features = dimensions[1L] %||% NULL,
+      cells = dimensions[2L] %||% NULL,
+      assays = bounded_vector(assay_names),
+      reduced_dimensions = bounded_vector(reduced_names)
+    ))
+  }
+  if (inherits(value, "SummarizedExperiment")) {
+    assay_names <- safe_exported_call("SummarizedExperiment", "assayNames", value, character())
+    dimensions <- safe_dimensions(value)
+    return(list(
+      kind = "summarized_experiment",
+      features = dimensions[1L] %||% NULL,
+      samples = dimensions[2L] %||% NULL,
+      assays = bounded_vector(assay_names)
+    ))
+  }
+  if (inherits(value, c("GRanges", "GenomicRanges"))) {
+    ranges <- tryCatch(
+      as.data.frame(utils::head(value, as.integer(max_rows))),
+      error = function(e) NULL
+    )
+    return(list(
+      kind = "genomic_ranges",
+      ranges = length(value),
+      preview = if (is.data.frame(ranges)) preview_data_frame(ranges, max_rows, max_cols) else NULL
+    ))
+  }
+  if (inherits(value, "ggplot")) {
+    plot_data <- tryCatch(value$data, error = function(e) NULL)
+    mapping <- tryCatch(names(value$mapping), error = function(e) character())
+    layers <- tryCatch(length(value$layers), error = function(e) NA_integer_)
+    labels <- tryCatch(value$labels, error = function(e) list())
+    return(list(
+      kind = "ggplot",
+      layers = layers,
+      mapping = bounded_vector(mapping),
+      labels = lapply(labels, bounded_scalar),
+      data_dimensions = if (is.data.frame(plot_data)) as.integer(dim(plot_data)) else NULL,
+      data_columns = if (is.data.frame(plot_data)) bounded_columns(names(plot_data), max_cols) else NULL
+    ))
+  }
+  NULL
+}
+
 preview_data_frame <- function(value,
                                max_rows = 8L,
                                max_cols = 8L,
@@ -270,6 +380,10 @@ rho_bounded_preview <- function(value,
                                 max_rows = 8L,
                                 max_cols = 8L,
                                 max_items = 12L) {
+  semantic <- rho_semantic_metadata(value, max_rows = max_rows, max_cols = max_cols)
+  if (!is.null(semantic)) {
+    return(semantic)
+  }
   if (is.data.frame(value)) {
     return(preview_data_frame(value, max_rows = max_rows, max_cols = max_cols))
   }
@@ -333,6 +447,7 @@ rho_inspect_object <- function(name,
     size_bytes = as.numeric(object.size(value)),
     typeof = typeof(value),
     preview_kind = rho_preview_kind(value),
+    semantic = rho_semantic_metadata(value, max_rows = max_rows, max_cols = max_cols),
     preview = rho_bounded_preview(
       value,
       max_rows = max_rows,
@@ -492,4 +607,3 @@ rho_render_document <- function(path,
     )
   )
 }
-

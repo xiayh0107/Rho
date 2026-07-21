@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101713" />
+    <meta
+      name="description"
+      content="Rho scientific runtime control plane for runs, R objects, artifacts, problems, approvals, and provenance."
+    />
+    <title>Rho · Scientific Runtime</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace-content">Skip to workspace content</a>
+    <div class="shell">
+      <aside class="rail" aria-label="Rho workspace navigation">
+        <div class="brand" aria-label="Rho">
+          <span class="brand-mark">ρ</span>
+          <span class="brand-copy"><strong>Rho</strong><small>Scientific runtime</small></span>
+        </div>
+        <nav id="workspace-nav">
+          <button class="nav-item active" data-view="runs" type="button"><span>01</span>Runs</button>
+          <button class="nav-item" data-view="objects" type="button"><span>02</span>Objects</button>
+          <button class="nav-item" data-view="plots" type="button"><span>03</span>Plots</button>
+          <button class="nav-item" data-view="problems" type="button"><span>04</span>Problems</button>
+          <button class="nav-item" data-view="approvals" type="button"><span>05</span>Approvals</button>
+          <button class="nav-item" data-view="provenance" type="button"><span>06</span>Provenance</button>
+        </nav>
+        <div class="rail-note">
+          <span>Agent thinks.</span>
+          <strong>Rho executes and proves.</strong>
+        </div>
+      </aside>
+
+      <main id="workspace-content">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Authoritative Workspace R</p>
+            <h1 id="view-title">Runs</h1>
+            <p id="view-description">Every scientific execution, revision, and outcome.</p>
+          </div>
+          <div class="runtime-actions">
+            <div class="runtime-pill" title="Runtime connection">
+              <span id="connection-dot" class="status-dot"></span>
+              <span id="workspace-label">Connecting…</span>
+            </div>
+            <button id="refresh-button" class="refresh-button" type="button">Refresh</button>
+          </div>
+        </header>
+
+        <section id="runtime-summary" class="summary-grid" aria-label="Runtime summary"></section>
+        <section id="view-content" class="content-panel" aria-live="polite">
+          <div class="loading-state"><span></span>Reading scientific state…</div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "rho": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "-p",
+        "rho-mcp",
+        "--",
+        "--server",
+        "${RHO_SERVER_URL:-http://127.0.0.1:8787}"
+      ]
+    }
+  }
+}

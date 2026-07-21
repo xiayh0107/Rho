@@ -1,5 +1,8 @@
 # Rho Agent-First Rearchitecture Plan
 
+Status: architecture foundation implemented on 2026-07-20. See ADR-010 and
+`docs/development-roadmap.md` for the active boundary and follow-on work.
+
 ## Vision
 
 Rho should evolve from a standalone AI R IDE into a scientific runtime layer that can be used by any Agent (Codex, Claude Code, Copilot, future agents) while providing an optional rich browser-based scientific workspace.
@@ -55,11 +58,12 @@ Expose scientific capabilities to external Agents:
 
 - workspace_open
 - workspace_status
-- execute
-- inspect_object
-- list_plots
-- list_problems
-- export_run
+- workspace_execute
+- object_inspect
+- run_history
+- problem_list
+- artifact_export
+- plot_view
 
 ### Rho CLI
 
@@ -130,4 +134,3 @@ Support:
 Rho succeeds when users can say:
 
 "I use Claude Code/Codex for my work, but Rho gives my Agent a real scientific workspace that understands R objects and preserves every decision."
-

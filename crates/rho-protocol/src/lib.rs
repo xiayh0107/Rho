@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 
 use chrono::Utc;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -9,7 +10,11 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub mod workbench;
+
+pub use workbench::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct WorkspaceIdentity {
     pub workspace_id: String,
     pub kernel_instance_id: String,
@@ -77,7 +82,7 @@ impl WorkspaceIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationClass {
     Probe,
@@ -86,14 +91,14 @@ pub enum OperationClass {
     StateAndProjectMutation,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ExpectedWorkspace {
     pub kernel_instance_id: Option<String>,
     pub state_revision: Option<u64>,
     pub project_revision: Option<u64>,
 }
 
-#[derive(Debug, Error, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StaleWorkspace {
     #[error("kernel instance changed: expected {expected}, actual {actual}")]
@@ -104,7 +109,7 @@ pub enum StaleWorkspace {
     Project { expected: u64, actual: u64 },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     Request,
@@ -113,7 +118,7 @@ pub enum MessageKind {
     Cancel,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct Envelope {
     pub protocol_version: u16,
     pub id: String,

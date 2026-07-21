@@ -1,0 +1,22 @@
+[mcp_servers.rho]
+command = "cargo"
+args = ["run", "--quiet", "-p", "rho-mcp", "--", "--server", "http://127.0.0.1:8787"]
+cwd = "."
+startup_timeout_sec = 60
+tool_timeout_sec = 300
+required = false
+enabled = true
+enabled_tools = [
+  "workspace_open",
+  "workspace_status",
+  "workspace_execute",
+  "object_inspect",
+  "run_history",
+  "problem_list",
+  "artifact_export",
+  "plot_view",
+]
+default_tools_approval_mode = "writes"
+
+[mcp_servers.rho.tools.workspace_execute]
+approval_mode = "prompt"

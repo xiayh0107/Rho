@@ -41,6 +41,32 @@ test_that("workspace snapshot reports environment contract", {
   expect_true(any(vapply(result$objects, function(item) identical(item$name, "qc"), logical(1))))
 })
 
+test_that("scientific classes expose semantic bounded metadata without package loading", {
+  fake_seurat <- structure(list(), class = "Seurat")
+  fake_sce <- structure(list(), class = c("SingleCellExperiment", "SummarizedExperiment"))
+  fake_se <- structure(list(), class = "SummarizedExperiment")
+  fake_ranges <- structure(list(1L, 2L, 3L), class = "GRanges")
+  fake_plot <- structure(
+    list(
+      data = data.frame(x = 1:3, y = 3:1),
+      mapping = list(x = quote(x), y = quote(y)),
+      layers = list(list()),
+      labels = list(title = "bounded plot")
+    ),
+    class = c("ggplot", "gg")
+  )
+
+  expect_equal(rho_semantic_metadata(fake_seurat)$kind, "seurat")
+  expect_equal(rho_semantic_metadata(fake_sce)$kind, "single_cell_experiment")
+  expect_equal(rho_semantic_metadata(fake_se)$kind, "summarized_experiment")
+  expect_equal(rho_semantic_metadata(fake_ranges)$kind, "genomic_ranges")
+  plot_metadata <- rho_semantic_metadata(fake_plot)
+  expect_equal(plot_metadata$kind, "ggplot")
+  expect_equal(plot_metadata$layers, 1L)
+  expect_equal(plot_metadata$data_dimensions, c(3L, 2L))
+  expect_equal(rho_preview_kind(fake_plot), "plot")
+})
+
 test_that("vector previews stay bounded", {
   workspace <- new.env(parent = baseenv())
   workspace$x <- 1:100

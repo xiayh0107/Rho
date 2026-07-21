@@ -1,164 +1,74 @@
-# Rho Development Roadmap
+# Rho development roadmap
 
-Date: 2026-07-16
-Current baseline: `0.2.0-dev.2` Windows workbench candidate
+Date: 2026-07-20
 
-Progress: `0.2.x` project-file foundation in progress. The first slice now
-provides a broker-safe project root, source file listing, multi-document
-frontend state, reads/writes, new files and Workspace R `setwd()` synchronization.
+Current architecture milestone: Agent-First Rho Architecture v0.1
 
 ## Direction
 
-The next objective is not another architecture spike. It is a reliable
-Windows daily-use slice in which a scientist can open a real R project, run
-code, inspect objects and plots, ask the Agent for help, review proposed
-changes and recover from ordinary errors without losing the Workspace R state.
+Rho is an Agent-native scientific runtime for R, not a desktop-first AI IDE. General Agents own reasoning and planning. Rho owns the persistent workspace, semantic R inspection, safe execution, artifacts, and proof.
 
-The two-session architecture remains the boundary:
+The dependency order is intentionally strict:
 
-- Workspace R is the only authority for live scientific objects and project
-  execution.
-- Agent R runs `aisdk`, model calls and orchestration.
-- Rust broker owns transport, revisions, approvals, persistence and process
-  lifecycle.
-- The Tauri frontend consumes broker/workbench events and does not talk to Ark
-  or `aisdk` directly.
+1. runtime identity and lifecycle;
+2. public protocol and events;
+3. CLI and MCP interoperability;
+4. scientific browser projections;
+5. remote and packaging projections.
 
-No aisdk family change is required for the next milestone. We will continue
-with the Rho adapter shims until a missing upstream seam is demonstrated by a
-concrete workflow and covered by an isolated compatibility test.
+Generic UI features do not move ahead of protocol stability.
 
-## Milestones
+## Implemented foundation
 
-### M1: Windows daily-use slice (`0.2.x`)
+- `rho-server` owns durable workspace identity, lifecycle, replayable events, and execution attachment.
+- Workbench Protocol 0.1 defines Workspace, Run, Object, Artifact, Problem, Approval, Provenance, schemas, and deep links.
+- `rho` provides stable machine-readable status, execution, object, problem, and plot commands.
+- `rho-mcp` provides eight semantic tools with MCP lifecycle and tool-result contracts.
+- The browser control plane renders Runs, Objects, Plots, Problems, Approvals, and Provenance.
+- Semantic object inspection covers data.frame, Seurat, SummarizedExperiment, SingleCellExperiment, GRanges, and ggplot.
+- Policy decisions are shared across direct users, MCP hosts, and internal Agent actions.
+- A remote gateway projects upstream HTTP and WebSocket state without taking ownership of it.
+- Codex and Claude Code project integrations, skills, bootstrap, and example workflows are included.
+- The desktop target is a tray/notification/file-association WebView wrapper over `rho-server`.
 
-Priority: highest. This is the next development target.
+## Next milestones
 
-Deliverables:
+### Protocol hardening
 
-- Open a local project directory and display a real file tree.
-- Edit and save multiple `.R` files; preserve the active document and cursor
-  position across restarts.
-- Replace the prototype textarea with a language-aware editor, completion and
-  source/run selection commands.
-- Keep Console, Plots, Problems, Environment and the resizable panel layout
-  working with real project files.
-- Add explicit user/agent/system execution origin, timestamps and run links.
-- Add a real approval surface for Act-mode `run_r`, package installation and
-  shell-like operations.
-- Persist the Agent timeline and restore it after Agent R restarts while
-  preserving the independent Workspace R session.
-- Add user-facing cancellation, timeout, crash and restart states.
+- Compatibility fixtures for each public entity and event.
+- Authentication and deployment profiles for non-loopback servers.
+- Explicit protocol deprecation and migration policy.
+- Reconnect, replay, duplicate-execution, and crash-recovery stress tests.
 
-Completed in the first `0.2.x` slice:
+### Remote compute adapters
 
-- project root and source-file listing API;
-- path traversal protection and editable extension allowlist;
-- multiple open document state with file-tree and document-tab rendering;
-- read, save and create-file commands;
-- Workspace R working-directory synchronization on project open.
+- SSH-managed Linux runtime lifecycle.
+- Scheduler adapters for Slurm and other HPC environments.
+- Long-running job status, cancellation, and resource reporting.
+- Authenticated cloud gateway deployment and workspace discovery.
 
-Still required to close M1:
+All adapters must preserve the same workspace, approval, run, and provenance semantics as local execution.
 
-- native directory picker and project-opening UX;
-- durable document/session restoration;
-- editor completion and source/run selection commands;
-- real approval, cancellation, error/retry and Agent restart flows.
+### Scientific depth
 
-Acceptance gate:
+- More Bioconductor and spatial/single-cell semantic adapters.
+- Environment capture for renv, Bioconductor, system libraries, and containers.
+- Reproducible report export from selected provenance subgraphs.
+- Larger artifact stores with bounded previews and content-addressed transfer.
 
-> A user can open a small single-cell R project, execute a QC script, inspect
-> an object and plot, ask DeepSeek to explain an error, approve a correction,
-> and restart either R process without losing the project or audit trail.
+### Release engineering
 
-### M2: Scientific workflow foundation (`0.3.x`)
+- Cross-platform `rho`, `rho-mcp`, `rho-server`, and desktop packages.
+- Signed installers and reproducible dependency/license manifests.
+- Windows, macOS, and Linux end-to-end client matrices.
+- Stable upgrade and rollback procedures for persisted workspace state.
 
-Priority: high after M1 is stable.
+## Decision checkpoint
 
-Deliverables:
+Every milestone must answer:
 
-- `renv` detection, status, initialize, restore and snapshot workflows.
-- Bioconductor version and package diagnostics.
-- Bounded viewers for data frames and common bioinformatics objects.
-- Plot history, export and provenance links back to code and run records.
-- Quarto `.qmd` and `.Rmd` editing/rendering with structured Problems output.
-- Project-scoped skills and the first `aisdk.bioc` semantic adapters through
-  Workspace R probes.
-
-Acceptance gate:
-
-> A second user can reproduce a selected QC result from the project files,
-> environment metadata, run record and generated artifacts without relying on
-> chat text alone.
-
-### M3: Cross-platform beta (`0.4.x`)
-
-Priority: after the Windows contract is stable.
-
-Deliverables:
-
-- macOS arm64/x64 and Linux x64 process and packaging probes.
-- One generated Workbench Protocol contract across Tauri and browser mode.
-- Platform-specific R discovery, paths, signals, permissions and WebView
-  behavior.
-- Signed internal builds and a dependency/license manifest.
-- Cross-platform fixtures for Unicode, paths with spaces, plots, HTML and
-  large object summaries.
-
-Acceptance gate:
-
-> The same project workflow and protocol tests pass on Windows, macOS and
-> Linux without platform-specific frontend behavior leaking into Workspace R
-> semantics.
-
-### M4: Advanced execution and reproducibility (`0.5.x`)
-
-Priority: after local workflows are dependable.
-
-Deliverables:
-
-- Debugger/DAP integration where Ark and R support it.
-- Long-running jobs with checkpoints and resource monitoring.
-- Exportable run reports with code, environment, artifacts and approvals.
-- Remote Workspace R, SSH and Slurm adapters behind the same broker contract.
-- Optional containerized workspace backend.
-
-Acceptance gate:
-
-> Local and remote runs have the same execution/revision/provenance semantics,
-> and disconnect/reconnect cannot duplicate a scientific execution.
-
-## Work order for the next iterations
-
-1. Fix the current prototype's remaining correctness gaps: durable run state,
-   cancellation, crash recovery, structured error/retry flow and real project
-   files.
-2. Productize the Windows workbench surface: multi-file editor, file tree,
-   approval dialogs, Environment/Plot viewers and session restoration.
-3. Add scientific environment operations: `renv`, Bioconductor, Quarto and
-   bounded object adapters.
-4. Freeze the Workbench Protocol and run the cross-platform transport and UI
-   matrix.
-5. Only then expand to remote compute, MCP-heavy workflows, debugger support
-   and public release hardening.
-
-## Explicitly deferred
-
-- Python, Jupyter Server and JupyterLab dependencies.
-- Electron or a second production frontend shell.
-- A second authoritative Workspace R session.
-- Broad aisdk family refactors without a demonstrated Rho use case.
-- Remote/cloud multi-user collaboration before local provenance is reliable.
-- Installer signing and auto-update until the product surface and release
-  identity are stable.
-
-## Decision checkpoints
-
-Every milestone should end with a short evidence review:
-
-- Which user workflow is now demonstrably complete?
-- Which state transitions and failure paths have tests?
-- Does the change preserve Workspace R authority and revision checks?
-- Does it introduce a real aisdk family gap, or can the Rho adapter remain
-  local?
-- Is the result ready for the next internal user, or only for another spike?
+- Does the runtime remain the only source of scientific truth?
+- Can a browser or Agent disconnect without destroying workspace state?
+- Do all clients observe the same identifiers, policy decisions, and provenance?
+- Is a new surface scientific state visualization, or accidental reinvention of an Agent/IDE feature?
+- Is the behavior covered by protocol-level tests rather than only one client UI?

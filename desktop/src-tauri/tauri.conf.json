@@ -4,21 +4,11 @@
   "version": "0.2.0-dev.2",
   "identifier": "org.yulab.rho",
   "build": {
-    "frontendDist": "../dist"
+    "frontendDist": "../../web"
   },
   "app": {
-    "withGlobalTauri": true,
-    "windows": [
-      {
-        "title": "Rho",
-        "width": 1440,
-        "height": 900,
-        "minWidth": 1024,
-        "minHeight": 680,
-        "center": true,
-        "resizable": true
-      }
-    ],
+    "withGlobalTauri": false,
+    "windows": [],
     "security": {
       "csp": null
     }
@@ -28,15 +18,25 @@
     "targets": ["nsis"],
     "resources": {
       "../resources/runtime/": "resources/runtime/",
-      "../resources/WebView2Loader.dll": "WebView2Loader.dll"
+      "../resources/WebView2Loader.dll": "WebView2Loader.dll",
+      "../../r/rho.bridge/": "resources/rho.bridge/"
     },
+    "fileAssociations": [
+      {
+        "ext": ["Rproj"],
+        "name": "R Project",
+        "description": "R project opened with the Rho scientific runtime",
+        "role": "Editor",
+        "mimeType": "text/plain"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "shortDescription": "An agent-native scientific workbench for R",
-    "longDescription": "Rho is a lightweight R workbench with an Ark-backed live session and an aisdk-powered AI collaborator."
+    "shortDescription": "Desktop launcher for the Rho scientific runtime",
+    "longDescription": "Rho Desktop starts rho-server and projects its browser-based scientific control plane in a small system wrapper."
   }
 }

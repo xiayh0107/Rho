@@ -1,76 +1,38 @@
-# Agent-First Rho Implementation TODO
+# Agent-First Rho implementation inventory
 
-> GitHub Issues are currently disabled in this repository. This checklist mirrors the planned issue backlog and can be converted into Issues after enabling them.
+This file records the architecture backlog implemented for the `Agent-First Rho Architecture v0.1` milestone. GitHub Issues are the tracking source; this inventory is kept for repository readers.
 
-## Epic 1 — Runtime-first architecture
+## Runtime and protocol
 
-- [ ] Define rho-server as the source of truth
-- [ ] Extract protocol layer from UI implementation
-- [ ] Define workspace identity model
-- [ ] Define revision and event model
-- [ ] Document runtime API contracts
+- [x] Make `rho-server` the source of truth.
+- [x] Persist workspace identity independently of clients.
+- [x] Preserve replayable runtime events and sessions across reconnects.
+- [x] Define independently versioned HTTP, WebSocket, JSON schema, artifact, and deep-link contracts.
+- [x] Define Workspace, Run, Object, Artifact, Problem, Approval, and Provenance.
 
-## Epic 2 — CLI and machine interface
+## Agent interoperability
 
-- [ ] Build rho CLI command structure
-- [ ] Add JSON output mode for Agent consumption
-- [ ] Support workspace status inspection
-- [ ] Support execution and run retrieval
-- [ ] Support object inspection commands
+- [x] Add the machine-readable `rho` CLI.
+- [x] Add the semantic `rho-mcp` server.
+- [x] Add Claude Code project configuration and plugin packaging.
+- [x] Add a repository-scoped Codex skill and MCP configuration.
+- [x] Add R project detection, project bootstrap, AGENTS template, and example workflow.
 
-## Epic 3 — MCP integration
+## Scientific control plane
 
-- [ ] Implement rho-mcp server
-- [ ] Define minimal MCP tools
-- [ ] Add Claude Code integration guide
-- [ ] Add Codex integration guide
-- [ ] Add generic Agent integration examples
+- [x] Add browser Runs, Objects, Plots, Problems, Approvals, and Provenance pages.
+- [x] Add bounded semantic inspection for core R and common scientific object classes.
+- [x] Link code, parameters, environment, revisions, objects, artifacts, and execution time in provenance.
+- [x] Share policy decisions across browser/API, CLI, MCP, and internal Agent actions.
 
-## Epic 4 — Browser Web App
+## Projections
 
-- [ ] Convert desktop UI logic into browser-compatible frontend
-- [ ] Create WebSocket/API communication layer
-- [ ] Build Run viewer
-- [ ] Build Object viewer
-- [ ] Build Plot viewer
-- [ ] Build Problems viewer
-- [ ] Build Approval viewer
-- [ ] Build Provenance timeline
+- [x] Add a remote HTTP/WebSocket gateway that leaves state upstream.
+- [x] Reduce desktop to `rho-server` plus an embedded browser, tray, notifications, startup, and file association.
+- [x] Rewrite product positioning around the Agent-first boundary.
 
-## Epic 5 — Scientific semantics
+## Follow-on hardening
 
-- [ ] R object inspection framework
-- [ ] Bioconductor object support
-- [ ] Seurat support
-- [ ] ggplot provenance
-- [ ] Artifact lineage tracking
-
-## Epic 6 — Safety and governance
-
-- [ ] Unified policy engine
-- [ ] Approval rules shared by Web/MCP/CLI
-- [ ] Local authentication token
-- [ ] Origin validation
-- [ ] Project filesystem isolation
-
-## Epic 7 — Remote execution
-
-- [ ] Remote rho-server support
-- [ ] HPC integration design
-- [ ] Long-running job management
-- [ ] Shared workspace support
-
-## Epic 8 — Optional Desktop wrapper
-
-- [ ] Keep desktop as thin WebView wrapper
-- [ ] Avoid desktop-only business logic
-- [ ] Package installers
-
-## Priority order
-
-1. Runtime protocol
-2. MCP + CLI
-3. Browser scientific workspace
-4. Agent integrations
-5. Remote execution
-6. Desktop packaging
+- [ ] Add authenticated non-loopback deployment profiles.
+- [ ] Add concrete SSH and scheduler lifecycle adapters behind the remote gateway.
+- [ ] Add protocol compatibility fixtures and multi-platform release matrices.

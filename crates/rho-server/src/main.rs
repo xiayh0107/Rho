@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::env;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -11,7 +12,7 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Parser)]
-#[command(name = "rho-server", about = "Rho Phase 0 runtime probes")]
+#[command(name = "rho-server", about = "Agent-native scientific runtime for R")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -19,6 +20,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Serve the durable Workbench Protocol over HTTP and WebSocket.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        #[arg(long, default_value = ".rho/state/runtime.sqlite")]
+        store: PathBuf,
+        #[arg(long)]
+        workspace_id: Option<String>,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Ark kernelspec to attach as the authoritative Workspace R.
+        #[arg(long)]
+        kernelspec: Option<PathBuf>,
+        /// Source package containing the rho.bridge R files.
+        #[arg(long, default_value = "r/rho.bridge")]
+        bridge_package: PathBuf,
+    },
+    /// Project a remote Rho runtime through a local browser/API gateway.
+    Gateway {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        #[arg(long)]
+        upstream: String,
+    },
     /// Report local toolchain and runtime availability.
     Doctor,
     /// Spawn a real Agent R process and verify the authenticated side channel.
@@ -96,6 +125,31 @@ struct DoctorReport {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Serve {
+            host,
+            port,
+            store,
+            workspace_id,
+            project_root,
+            kernelspec,
+            bridge_package,
+        } => {
+            serve(
+                host,
+                port,
+                store,
+                workspace_id,
+                project_root,
+                kernelspec,
+                bridge_package,
+            )
+            .await
+        }
+        Commands::Gateway {
+            host,
+            port,
+            upstream,
+        } => serve_gateway(host, port, upstream).await,
         Commands::Doctor => doctor(),
         Commands::ProbeAgentR {
             rscript,
@@ -134,6 +188,65 @@ async fn main() -> Result<()> {
         Commands::ProbeComms { kernelspec } => probe_comms(kernelspec).await,
         Commands::ProbeRichOutput { kernelspec } => probe_rich_output(kernelspec).await,
     }
+}
+
+async fn serve_gateway(host: IpAddr, port: u16, upstream: String) -> Result<()> {
+    let state = rho_server::gateway::GatewayState::new(&upstream)?;
+    let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .with_context(|| format!("binding Rho gateway to {host}:{port}"))?;
+    let address = listener.local_addr()?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "listening",
+            "mode": "remote_gateway",
+            "address": address,
+            "upstream": upstream,
+            "protocol_version": rho_protocol::WORKBENCH_PROTOCOL_VERSION
+        })
+    );
+    rho_server::gateway::serve(listener, state).await
+}
+
+async fn serve(
+    host: IpAddr,
+    port: u16,
+    store: PathBuf,
+    workspace_id: Option<String>,
+    project_root: Option<PathBuf>,
+    kernelspec: Option<PathBuf>,
+    bridge_package: PathBuf,
+) -> Result<()> {
+    let mut config = rho_server::runtime::RuntimeServiceConfig::new(store);
+    if let Some(workspace_id) = workspace_id {
+        config = config.with_workspace_id(workspace_id);
+    }
+    if let Some(project_root) = project_root {
+        config = config.with_project_root(project_root);
+    }
+    let runtime = rho_server::runtime::RuntimeService::open(config)?;
+    if let Some(kernelspec) = kernelspec {
+        runtime.start_ark(kernelspec, bridge_package).await?;
+    }
+    let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .with_context(|| format!("binding Rho runtime to {host}:{port}"))?;
+    let address = listener.local_addr()?;
+    let workspace = runtime.workspace().await;
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "listening",
+            "address": address,
+            "workspace_id": workspace.workspace_id,
+            "protocol_version": rho_protocol::WORKBENCH_PROTOCOL_VERSION
+        })
+    );
+    let server_result = rho_server::api::serve(listener, runtime.clone()).await;
+    let shutdown_result = runtime.shutdown_executor().await;
+    server_result?;
+    shutdown_result
 }
 
 async fn probe_rich_output(kernelspec: PathBuf) -> Result<()> {
