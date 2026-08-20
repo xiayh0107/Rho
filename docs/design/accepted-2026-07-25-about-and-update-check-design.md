@@ -82,7 +82,7 @@ Versions must be parsed and compared as Semantic Versioning values. String,
 date, release ID, and filename ordering are not acceptable substitutes. The
 optional leading `v` in a release tag is not part of the application version.
 
-### 2.3 Inform and redirect, but do not install
+### 2.3 Inform and redirect, but do not install (V1 compatibility boundary)
 
 V1 may discover an update and open the Rho release page. It must not:
 
@@ -94,7 +94,13 @@ V1 may discover an update and open the Rho release page. It must not:
 
 The update result must say that installation is user initiated. Automatic
 download and installation require a later signed-updater specification and
-end-to-end installer acceptance.
+end-to-end installer acceptance. `plans/active-2026-08-15-tauri-native-
+updater-spec.md` is the separately active contract: it authorizes a bounded
+supported-platform source implementation, but no Release may claim that native
+updating is enabled until its exact candidate, installed-app, and public
+endpoint gates pass. This V1 section remains the compatibility contract for
+the existing Pages/download manifest; it does not authorize native install by
+itself.
 
 ### 2.4 Update failure never blocks the workbench
 
@@ -127,9 +133,10 @@ startup does not schedule or perform an update request.
 
 V1 does not include:
 
-- Tauri updater integration;
-- update signing keys or updater signatures;
-- automatic installer download, execution, restart, rollback, or repair;
+- Tauri updater integration, update signing keys/signatures, automatic
+  installer download/execution/restart, rollback, or repair **within V1**.
+  Those behaviors are owned only by the separate active native-updater
+  contract above; V1 must not implement or claim them by itself;
 - hosting installers in the GitHub Pages repository;
 - a domestic object-storage or CDN mirror;
 - fallback mirrors or download-speed selection;
@@ -224,14 +231,21 @@ The terminal states are:
 
 | State | Required presentation | Primary action |
 | --- | --- | --- |
-| `update_available` | Installed version, available version, publication date, and short notes | `View Update` |
+| `update_available` | Installed version, available version, publication date, and bounded notes | `Install and Restart` on supported native-updater builds; otherwise `View Update` for V1 compatibility builds |
 | `up_to_date` | Installed version and confirmation that it is current for its channel | `Close` |
-| `newer_than_feed` | Explain that the installed build is newer than the published feed | `Close` |
 | `check_failed` | Concise failure category without raw response bodies or secrets | `Try Again` |
 
-`View Update` opens the validated `release_page_url` from the manifest in the
-system browser. The update modal must not navigate the workbench WebView away
-from Rho.
+For the active native updater on Windows x64 and Apple Silicon macOS,
+`Install and Restart` is a second explicit user action. It downloads a pending
+signed artifact, verifies it before stopping runtime work, then invokes the
+platform installer/restart path. The WebView does not receive a generic
+updater command, signing key, arbitrary endpoint, or installer arguments. An
+unavailable platform, stale pending update, download/signature failure, or
+installation failure is shown truthfully and never presented as installed.
+
+`View Update` remains the V1 compatibility action: it opens the validated
+`release_page_url` in the system browser. Neither action navigates the
+workbench WebView away from Rho.
 
 Rho does not check automatically. The update service is first contacted only
 after the user selects `Check for Updates...` or `Try Again` in this dialog.
@@ -265,7 +279,12 @@ and must not initiate another R or Agent probe.
 The existing release metadata check continues to enforce agreement between the
 Cargo workspace, Tauri config, and frontend package versions.
 
-## 6. Update Manifest Contract
+## 6. Legacy Update-Site Manifest Contract
+
+This schema-v1 manifest remains the GitHub Pages download-site compatibility
+format. It is not parsed by the supported native updater. The separate active
+native-updater specification owns the Tauri manifest, its signature files, and
+the native install path.
 
 Each channel endpoint returns one UTF-8 JSON document:
 
@@ -312,10 +331,10 @@ Required validation:
 - every present `sha256` is exactly 64 lowercase hexadecimal characters;
 - every present `size` is a positive integer.
 
-The client must reject the entire manifest if a required field fails
-validation. It must cap the response body at 64 KiB and use a total request
-timeout of 10 seconds. Redirects for the manifest endpoint must remain HTTPS
-and end on `yulab-smu.top`.
+The V1 compatibility consumer must reject the entire manifest if a required
+field fails validation. It must cap the response body at 64 KiB and use a
+total request timeout of 10 seconds. Redirects for the manifest endpoint must
+remain HTTPS and end on `yulab-smu.top`.
 
 V1 displays the artifact checksum on the website but does not download the
 artifact, so checksum verification is not a client V1 behavior.
@@ -505,7 +524,9 @@ Against the exact installed candidate:
 - offline and blocked-network checks are recoverable and do not affect Rho;
 - startup and ordinary workbench use make no update request, and the first
   request follows the explicit manual command;
-- `View Update` opens the Rho page in the system browser;
+- a V1 compatibility build's `View Update` opens the Rho page in the system
+  browser; supported native-updater builds instead verify and install only
+  after the separate `Install and Restart` action;
 - the Rho page is understandable without GitHub knowledge;
 - the GitHub-hosted installer limitation is visible;
 - menus and dialogs work at the minimum window size and with keyboard-only

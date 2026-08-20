@@ -225,3 +225,49 @@ commit `f05315cde735f011a76c1400bdadd28d21acc57e`. Issue #2 closed from the
 PR's source-fix relationship. This establishes only the reviewed `dev.29`
 default-branch source identity; no candidate, artifact, installed acceptance,
 MAC5, publication, or update-site fact was created or inferred.
+
+## 2026-08-14 extension: rho-server CLI probes close the same transport gap
+
+The desktop interactive paths (Agent turn, connection test, Agent runtime
+probe, model probes) already transported Agent R code in flushed UTF-8
+temporary `.R` files. Two rho-server CLI probe subcommands still passed their
+multi-line Agent R programs through `Rscript -e`, the exact pattern this
+repair eliminated (PR #24 converted only the turn launcher). On 2026-08-14,
+while investigating a Linux DeepSeek reachability report, both remaining
+launches were converted to the same invariant:
+
+- `crates/rho-server/src/coordinator.rs`: `probe_coordinator` now launches
+  `coordinator_probe_script()` from a `write_coordinator_probe_script()`
+  temporary `.R` file via `coordinator_probe_args(...)` — no `-e`;
+- `crates/rho-server/src/main.rs`: `probe agent-r` now launches
+  `agent_r_probe_script()` the same way — no `-e`;
+- regression tests assert a flushed UTF-8 `.R` file is used and no `-e` or
+  script body appears in the native process arguments (mirroring the
+  `desktop_agent_script_uses_a_flushed_utf8_r_file_instead_of_inline_e`
+  test);
+- the temporary-file owner stays in scope until the spawned child is reaped
+  in both functions.
+
+Verification on 2026-08-14: `cargo build -p rho-server --locked` and
+`cargo test -p rho-server --locked` pass (60 lib + 1 bin tests, including the
+two new regressions); `cargo fmt --all -- --check` clean. No provider,
+credential, model-routing, schema, persistence, project, approval, frontend,
+or public-protocol behavior changed; no version or NEWS change (CLI
+diagnostics only, no user-visible application behavior).
+
+## 2026-08-14 resolution of the Linux DeepSeek reachability report
+
+The reported "cannot reach the service" failure was reproduced with the
+app's exact R-side connection-test path and traced to an environment gap, not
+an application defect: the reporting R library had `aisdk` 1.5.0 but was
+missing the pinned `aisdk.providers` 0.1.0 (exact commit
+`5cf315e5eedad7d83b224c96595da346e1192a85`), which the active credential
+spec and README require for DeepSeek and the other registered providers.
+`rho_test_model_profile` then failed at the provider-admission gate with the
+actionable message "The selected provider requires aisdk.providers 0.1.0 or
+later..." and `error_class` `provider`, before any network call. The Rust
+model-discovery endpoint and the R-side call both reach
+`api.deepseek.com` (401 with a dummy key) once the package is present.
+Remediation: `remotes::install_github("YuLab-SMU/aisdk.providers@5cf315e5eedad7d83b224c96595da346e1192a85")`
+into the R user library (also installable from Rho's environment panel). No
+source change was required; no version or NEWS impact.

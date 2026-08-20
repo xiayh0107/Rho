@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::UNIX_EPOCH;
@@ -484,6 +486,7 @@ impl PendingApprovalRegistry {
 struct DesktopAgentCompletion {
     events: Vec<Value>,
     final_message: Option<String>,
+    error_message: Option<String>,
     failed: bool,
 }
 
@@ -534,25 +537,12 @@ pub async fn probe(
     shutdown_result
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_probe(
-    session: &ArkSession,
-    broker: &mut BrokerState,
-    store: &mut Store,
-    rscript: PathBuf,
-    agent_package: PathBuf,
-    bridge_package: PathBuf,
-    recovered_runs: usize,
-    store_path: &Path,
-    model: Option<String>,
-    prompt: String,
-) -> Result<()> {
-    bootstrap_bridge(session, broker, store, &bridge_package).await?;
-
-    let mut authenticator = AgentAuthenticator::bind().await?;
-    let address = authenticator.local_addr()?;
-    let token = authenticator.bootstrap_token()?.to_string();
-    let script = r#"
+/// Multi-line Agent R coordinator probe program. Per the active
+/// `windows-agent-r-script-launch-repair-spec` invariant, Agent R code is
+/// transported in a flushed UTF-8 temporary `.R` file, never as a multi-line
+/// `-e` argument (the pattern that failed Windows turns with `0xc0000005`).
+fn coordinator_probe_script() -> &'static str {
+    r#"
 args <- commandArgs(TRUE)
 source(file.path(args[[2]], "R", "aaa-state.R"))
 source(file.path(args[[2]], "R", "transport.R"))
@@ -633,20 +623,76 @@ if (identical(args[[3]], "mock")) {
   )
 }
 close(connection)
-"#;
+"#
+}
+
+fn write_coordinator_probe_script() -> Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+
+    let mut script_file = tempfile::Builder::new()
+        .prefix("rho-coordinator-probe-")
+        .suffix(".R")
+        .tempfile()
+        .context("creating Agent R coordinator probe script file")?;
+    script_file
+        .write_all(coordinator_probe_script().as_bytes())
+        .context("writing Agent R coordinator probe script file")?;
+    script_file
+        .flush()
+        .context("flushing Agent R coordinator probe script file")?;
+    Ok(script_file)
+}
+
+fn coordinator_probe_args(
+    script_path: &Path,
+    port: u16,
+    agent_package: &Path,
+    model: &str,
+    prompt: &str,
+) -> Vec<OsString> {
+    vec![
+        script_path.as_os_str().to_os_string(),
+        OsString::from(port.to_string()),
+        agent_package.as_os_str().to_os_string(),
+        OsString::from(model.to_string()),
+        OsString::from(prompt.to_string()),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_probe(
+    session: &ArkSession,
+    broker: &mut BrokerState,
+    store: &mut Store,
+    rscript: PathBuf,
+    agent_package: PathBuf,
+    bridge_package: PathBuf,
+    recovered_runs: usize,
+    store_path: &Path,
+    model: Option<String>,
+    prompt: String,
+) -> Result<()> {
+    bootstrap_bridge(session, broker, store, &bridge_package).await?;
+
+    let mut authenticator = AgentAuthenticator::bind().await?;
+    let address = authenticator.local_addr()?;
+    let token = authenticator.bootstrap_token()?.to_string();
+    let script_file = write_coordinator_probe_script()?;
 
     let real_model = model.is_some();
     let model_arg = model.clone().unwrap_or_else(|| "mock".to_string());
 
+    let args = coordinator_probe_args(
+        script_file.path(),
+        address.port(),
+        &agent_package,
+        &model_arg,
+        &prompt,
+    );
     let mut command = tokio::process::Command::new(rscript);
     hide_console_window(&mut command);
     let mut child = command
-        .arg("-e")
-        .arg(script)
-        .arg(address.port().to_string())
-        .arg(agent_package)
-        .arg(&model_arg)
-        .arg(prompt)
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1424,6 +1470,25 @@ fn bounded_agent_context_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+const MAX_PROVIDER_FAILURE_BYTES: usize = 2 * 1024;
+
+fn bounded_provider_failure(payload: &Value) -> String {
+    let value = payload
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("Provider request failed without details.");
+    let value = redact_sensitive_text(value);
+    if value.len() <= MAX_PROVIDER_FAILURE_BYTES {
+        return value;
+    }
+    let suffix = "... [truncated]";
+    let mut end = MAX_PROVIDER_FAILURE_BYTES - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], suffix)
+}
+
 fn is_valid_project_skill_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 48
@@ -1897,6 +1962,14 @@ fn desktop_agent_turn_stdin(
 const DESKTOP_AGENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 const DESKTOP_AGENT_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(86_400);
 
+pub trait WorkspaceSnapshotAdapter: Send + Sync {
+    fn snapshot<'a>(
+        &'a self,
+        payload: Value,
+        execution_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
+}
+
 fn configure_agent_process_environment(
     command: &mut tokio::process::Command,
     process_path: Option<&std::ffi::OsStr>,
@@ -1931,6 +2004,7 @@ pub async fn run_agent_turn(
     environment_approvals: Arc<PendingApprovalRegistry>,
     auto_approve: bool,
     editor_context: Option<Value>,
+    workspace_snapshot_adapter: Option<Arc<dyn WorkspaceSnapshotAdapter>>,
 ) -> Result<Value> {
     ensure!(
         matches!(mode.as_str(), "ask" | "plan" | "act"),
@@ -2047,6 +2121,7 @@ pub async fn run_agent_turn(
             approvals.clone(),
             environment_approvals.clone(),
             auto_approve,
+            workspace_snapshot_adapter,
         )
         .await;
         let output = tokio::time::timeout(
@@ -2083,7 +2158,7 @@ pub async fn run_agent_turn(
             state_revision_after: Some(after.state_revision as i64),
             project_revision_after: Some(after.project_revision as i64),
             final_message: completion.final_message.clone(),
-            error_message: None,
+            error_message: completion.error_message.clone(),
         })?;
         Ok(json!({
             "turn_id": turn_id,
@@ -2125,6 +2200,7 @@ async fn serve_desktop_agent(
     approvals: Arc<PendingApprovalRegistry>,
     environment_approvals: Arc<PendingApprovalRegistry>,
     auto_approve: bool,
+    workspace_snapshot_adapter: Option<Arc<dyn WorkspaceSnapshotAdapter>>,
 ) -> Result<DesktopAgentCompletion> {
     let mut events = Vec::new();
     let mut final_message = None;
@@ -2185,6 +2261,7 @@ async fn serve_desktop_agent(
                                 context.clone(),
                                 turn_id,
                                 workspace_lane.clone(),
+                                workspace_snapshot_adapter.clone(),
                             )
                             .await
                         }
@@ -2216,11 +2293,14 @@ async fn serve_desktop_agent(
                     &incoming.payload,
                 )?;
                 let agent_failed = incoming.payload["type"] == "desktop.agent_failed";
+                let error_message =
+                    agent_failed.then(|| bounded_provider_failure(&incoming.payload));
                 events.push(incoming.payload);
                 if completed || agent_failed {
                     return Ok(DesktopAgentCompletion {
                         events,
                         final_message,
+                        error_message,
                         failed: agent_failed,
                     });
                 }
@@ -2242,6 +2322,7 @@ async fn dispatch_agent_workspace_request(
     context: Arc<Mutex<CoordinatorRuntime>>,
     turn_id: &str,
     workspace_lane: Arc<AgentWorkspaceLane>,
+    workspace_snapshot_adapter: Option<Arc<dyn WorkspaceSnapshotAdapter>>,
 ) -> Result<Value> {
     let _lane_guard = match workspace_lane.gate.try_lock() {
         Ok(guard) => guard,
@@ -2251,8 +2332,18 @@ async fn dispatch_agent_workspace_request(
         }
     };
     let execution_id = format!("agent_workspace_{}", Uuid::new_v4().simple());
-    let mut context = context.lock().await;
     let _execution_guard = workspace_lane.begin_execution(turn_id, &execution_id)?;
+    if let Some(result) = dispatch_workspace_snapshot_adapter(
+        request_type,
+        payload,
+        &execution_id,
+        workspace_snapshot_adapter.as_ref(),
+    )
+    .await
+    {
+        return result;
+    }
+    let mut context = context.lock().await;
     let CoordinatorRuntime { broker, store } = &mut *context;
     dispatch_workspace_request_with_execution_id(
         request_type,
@@ -2264,6 +2355,23 @@ async fn dispatch_agent_workspace_request(
         Some(&execution_id),
     )
     .await
+}
+
+async fn dispatch_workspace_snapshot_adapter(
+    request_type: &str,
+    payload: &Value,
+    execution_id: &str,
+    adapter: Option<&Arc<dyn WorkspaceSnapshotAdapter>>,
+) -> Option<Result<Value>> {
+    if request_type != "workspace.snapshot" {
+        return None;
+    }
+    let adapter = adapter?;
+    Some(
+        adapter
+            .snapshot(payload.clone(), execution_id.to_string())
+            .await,
+    )
 }
 
 async fn record_agent_workspace_wait(
@@ -3033,10 +3141,25 @@ fn project_agent_turn_event(turn_id: &str, payload: &Value) -> Result<Option<Age
             None,
             None,
         )),
+        "desktop.agent_failed" => Some((
+            "desktop.agent_failed",
+            "Provider request failed".to_string(),
+            Some(bounded_provider_failure(payload)),
+            "error".to_string(),
+            None,
+            None,
+            None,
+        )),
         _ => None,
     };
 
-    let details_json = serde_json::to_string(payload)?;
+    let details_json = if event_type == "desktop.agent_failed" {
+        let mut bounded = payload.clone();
+        bounded["error"] = Value::String(bounded_provider_failure(payload));
+        serde_json::to_string(&bounded)?
+    } else {
+        serde_json::to_string(payload)?
+    };
     Ok(mapped.map(
         |(event_type, title, body, status, tool, request_id, code)| AgentTurnEventDraft {
             turn_id: turn_id.to_string(),
@@ -5034,7 +5157,26 @@ impl Drop for ResultFile {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
+
+    struct RecordingSnapshotAdapter {
+        calls: Arc<StdMutex<Vec<(Value, String)>>>,
+    }
+
+    impl WorkspaceSnapshotAdapter for RecordingSnapshotAdapter {
+        fn snapshot<'a>(
+            &'a self,
+            payload: Value,
+            execution_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((payload.clone(), execution_id));
+            Box::pin(async move { Ok(json!({"adapted": payload})) })
+        }
+    }
 
     #[tokio::test]
     async fn pending_approval_cancellation_is_scoped_to_the_owning_turn() {
@@ -5192,6 +5334,52 @@ mod tests {
         drop(execution);
         lane.clear_turn_cancellation("turn-active");
         lane.clear_turn_cancellation("turn-other");
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_adapter_is_exact_and_preserves_payload_and_execution_id() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let adapter: Arc<dyn WorkspaceSnapshotAdapter> = Arc::new(RecordingSnapshotAdapter {
+            calls: Arc::clone(&calls),
+        });
+        let payload = json!({
+            "arguments": {},
+            "expected_workspace": {"state_revision": 7}
+        });
+        let result = dispatch_workspace_snapshot_adapter(
+            "workspace.snapshot",
+            &payload,
+            "agent_workspace_exact",
+            Some(&adapter),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["adapted"], payload);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(payload, "agent_workspace_exact".to_string())]
+        );
+        assert!(
+            dispatch_workspace_snapshot_adapter(
+                "workspace.inspect_object",
+                &json!({}),
+                "agent_workspace_other",
+                Some(&adapter),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            dispatch_workspace_snapshot_adapter(
+                "workspace.snapshot",
+                &json!({}),
+                "agent_workspace_legacy",
+                None,
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5712,6 +5900,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_failure_is_redacted_bounded_and_projected_to_the_timeline() {
+        let payload = json!({
+            "type": "desktop.agent_failed",
+            "model": "private:model",
+            "error": format!(
+                "API request failed with status 429\nURL: [REDACTED]/messages?key=secret-value\nAuthorization: Bearer another-secret\n{}",
+                "测".repeat(3_000)
+            )
+        });
+
+        let failure = bounded_provider_failure(&payload);
+        assert!(failure.len() <= MAX_PROVIDER_FAILURE_BYTES);
+        assert!(failure.ends_with("... [truncated]"));
+        assert!(!failure.contains("secret-value"));
+        assert!(!failure.contains("another-secret"));
+        assert!(failure.contains("status 429"));
+
+        let event = project_agent_turn_event("turn-provider-failed", &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_type, "desktop.agent_failed");
+        assert_eq!(event.title, "Provider request failed");
+        assert_eq!(event.status, "error");
+        assert_eq!(event.body.as_deref(), Some(failure.as_str()));
+        let details: Value = serde_json::from_str(&event.details_json).unwrap();
+        assert_eq!(details["error"], failure);
+        assert!(!event.details_json.contains("secret-value"));
+        assert!(!event.details_json.contains("another-secret"));
+    }
+
+    #[test]
+    fn provider_failure_without_error_remains_truthful_and_success_stays_clean() {
+        assert_eq!(
+            bounded_provider_failure(&json!({"type": "desktop.agent_failed"})),
+            "Provider request failed without details."
+        );
+        let completed = project_agent_turn_event(
+            "turn-provider-completed",
+            &json!({"type": "desktop.agent_completed"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(completed.event_type, "desktop.agent_completed");
+        assert_eq!(completed.status, "completed");
+        assert!(completed.body.is_some());
+    }
+
+    #[test]
     fn retry_prompt_carries_the_previous_failed_goal() {
         let history = vec![AgentConversationTurn {
             turn_id: "turn_plot".to_string(),
@@ -6047,6 +6283,44 @@ mod tests {
                 Path::new("r/rho.agent").as_os_str().to_os_string(),
                 OsString::from("act"),
             ]
+        );
+    }
+
+    #[test]
+    fn coordinator_probe_script_uses_a_flushed_utf8_r_file_instead_of_inline_e() {
+        let script_file = write_coordinator_probe_script().unwrap();
+        let script_path = script_file.path();
+        let args = coordinator_probe_args(
+            script_path,
+            4321,
+            Path::new("r/rho.agent"),
+            "mock",
+            "probe prompt",
+        );
+
+        assert_eq!(
+            script_path.extension().and_then(|value| value.to_str()),
+            Some("R")
+        );
+        assert_eq!(
+            std::fs::read_to_string(script_path).unwrap(),
+            coordinator_probe_script()
+        );
+        assert_eq!(
+            args,
+            vec![
+                script_path.as_os_str().to_os_string(),
+                OsString::from("4321"),
+                Path::new("r/rho.agent").as_os_str().to_os_string(),
+                OsString::from("mock"),
+                OsString::from("probe prompt"),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-e"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("rho_agent_connect"))
         );
     }
 

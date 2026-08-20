@@ -26,8 +26,13 @@ assert.equal(
   undefined,
   "AGPL notice is a bundled resource, not an installer click-through EULA",
 );
+assert.deepEqual(base.plugins.updater.endpoints, [
+  "https://yulab-smu.top/Rho/updates/tauri/stable.json",
+]);
+assert.match(base.plugins.updater.pubkey, /^[A-Za-z0-9+/=]+$/);
 
 assert.deepEqual(windows.bundle.targets, ["nsis"]);
+assert.equal(windows.bundle.createUpdaterArtifacts, true);
 assert.equal(
   windows.bundle.resources["../resources/WebView2Loader.dll"],
   "WebView2Loader.dll",
@@ -44,6 +49,7 @@ assert.equal(
 assert.ok(windows.bundle.icon.includes("icons/icon.ico"));
 
 assert.deepEqual(macos.bundle.targets, ["app", "dmg"]);
+assert.equal(macos.bundle.createUpdaterArtifacts, true);
 assert.deepEqual(macos.bundle.externalBin, ["binaries/ark"]);
 assert.deepEqual(macos.bundle.resources, {
   "../../LICENSE": "licenses/rho/LICENSE.txt",

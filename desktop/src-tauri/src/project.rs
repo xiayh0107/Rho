@@ -325,18 +325,6 @@ impl ProjectWatcherControl {
     }
 }
 
-pub fn replace_project_watcher(
-    watcher: &mut Option<ProjectWatcherControl>,
-    app: AppHandle,
-    root: PathBuf,
-) -> Result<()> {
-    if let Some(existing) = watcher.take() {
-        existing.stop();
-    }
-    *watcher = Some(start_project_watcher(app, root)?);
-    Ok(())
-}
-
 pub fn start_project_watcher(app: AppHandle, root: PathBuf) -> Result<ProjectWatcherControl> {
     let (event_tx, event_rx) = channel();
     let (stop_tx, stop_rx) = channel();
@@ -829,6 +817,20 @@ mod tests {
         );
         assert!(read_viewer_file(&root, "invalid.md").is_err());
         assert!(read_viewer_file(&root, ".").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_file_rejects_symlink_escape() {
+        let directory = TempDir::new().unwrap();
+        let root_path = directory.path().join("project");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let outside = directory.path().join("outside.html");
+        std::fs::write(&outside, "<p>outside</p>").unwrap();
+        std::os::unix::fs::symlink(&outside, root_path.join("linked.html")).unwrap();
+        let root = root_path.canonicalize().unwrap();
+
+        assert!(read_viewer_file(&root, "linked.html").is_err());
     }
 
     #[test]

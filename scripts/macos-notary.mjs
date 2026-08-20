@@ -154,30 +154,57 @@ function hashBuffer(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
-function expectedDmgName(version) {
-  return `Rho_${version}_aarch64.dmg`;
+const NOTARY_ARTIFACT_KINDS = new Set(["dmg", "app_zip"]);
+
+function normalizedArtifactKind(value) {
+  if (!NOTARY_ARTIFACT_KINDS.has(value)) fail("Notary artifact kind is invalid");
+  return value;
 }
 
-function commonRecord(identity, status, type) {
-  return {
+function expectedNotaryArtifactName(version, artifactKind) {
+  const kind = normalizedArtifactKind(artifactKind);
+  return kind === "dmg"
+    ? `Rho_${version}_aarch64.dmg`
+    : `Rho_${version}_aarch64.app.zip`;
+}
+
+function recordArtifactKind(record) {
+  return normalizedArtifactKind(record.artifact_kind ?? "dmg");
+}
+
+function expectedNotaryLogName(version, artifactKind) {
+  return artifactKind === "dmg"
+    ? `rho-${version}-macos-notary-log.json`
+    : `rho-${version}-macos-app-archive-notary-log.json`;
+}
+
+function commonRecord(identity, status, type, artifactKind = "dmg") {
+  const record = {
     schema_version: 1,
     type,
     status,
     ...identity,
     platform: "macos_aarch64",
   };
+  if (normalizedArtifactKind(artifactKind) !== "dmg") record.artifact_kind = artifactKind;
+  return record;
 }
 
-export function createPendingRecord({ receiptPath, dmgPath, ...identityInput }) {
+export function createPendingRecord({ receiptPath, dmgPath, artifactPath, artifactKind = "dmg", ...identityInput }) {
   const identity = validateIdentity(identityInput);
   const receipt = readJsonFile(receiptPath, MAX_NOTARY_RECEIPT_BYTES, "Notary submission receipt");
   const id = normalizeSubmissionId(receipt.id);
   if (receipt.message != null) boundedString(receipt.message, "Notary submission message", 1024);
-  const artifactName = path.basename(dmgPath);
-  if (artifactName !== expectedDmgName(identity.version)) fail("Submitted DMG name does not match the candidate identity");
-  const artifact = hashFile(dmgPath);
+  const kind = normalizedArtifactKind(artifactKind);
+  const submittedArtifactPath = artifactPath ?? dmgPath;
+  if (!submittedArtifactPath) fail("Notary submission artifact is missing");
+  const artifactName = path.basename(submittedArtifactPath);
+  if (artifactName !== expectedNotaryArtifactName(identity.version, kind)) {
+    fail("Submitted notarization artifact name does not match the candidate identity");
+  }
+  const artifact = hashFile(submittedArtifactPath);
   return {
-    ...commonRecord(identity, "pending", "rho_macos_notary_pending"),
+    ...commonRecord(identity, "pending", "rho_macos_notary_pending", kind),
     submission: {
       id,
       artifact_name: artifactName,
@@ -188,7 +215,7 @@ export function createPendingRecord({ receiptPath, dmgPath, ...identityInput }) 
 }
 
 function validateCommonRecord(record, expectedType, expectedStatus) {
-  assertExactKeys(record, [
+  const baseKeys = [
     "schema_version",
     "type",
     "status",
@@ -201,7 +228,13 @@ function validateCommonRecord(record, expectedType, expectedStatus) {
     "run_attempt",
     "platform",
     "submission",
-  ], expectedType);
+  ];
+  const artifactKind = recordArtifactKind(record);
+  assertExactKeys(
+    record,
+    Object.hasOwn(record, "artifact_kind") ? [...baseKeys, "artifact_kind"] : baseKeys,
+    expectedType,
+  );
   if (record.schema_version !== 1 || record.type !== expectedType || record.status !== expectedStatus) {
     fail(`${expectedType} schema, type, or status is invalid`);
   }
@@ -215,7 +248,7 @@ function validateCommonRecord(record, expectedType, expectedStatus) {
     runId: record.run_id,
     runAttempt: record.run_attempt,
   });
-  return record;
+  return { record, artifact_kind: artifactKind };
 }
 
 function validateExpectedIdentity(record, expected = {}) {
@@ -236,10 +269,12 @@ function validateExpectedIdentity(record, expected = {}) {
 }
 
 export function validatePendingRecord(record, expected = {}) {
-  validateCommonRecord(record, "rho_macos_notary_pending", "pending");
+  const common = validateCommonRecord(record, "rho_macos_notary_pending", "pending");
   assertExactKeys(record.submission, ["id", "artifact_name", "size_bytes", "sha256"], "Pending submission");
   record.submission.id = normalizeSubmissionId(record.submission.id);
-  if (record.submission.artifact_name !== expectedDmgName(record.version)) fail("Pending artifact name is invalid");
+  if (record.submission.artifact_name !== expectedNotaryArtifactName(record.version, common.artifact_kind)) {
+    fail("Pending artifact name is invalid");
+  }
   if (!Number.isSafeInteger(record.submission.size_bytes) || record.submission.size_bytes <= 0 || record.submission.size_bytes > MAX_NOTARY_DMG_BYTES) {
     fail("Pending artifact size is invalid");
   }
@@ -372,7 +407,7 @@ function parseStatusResponse(body, pending) {
   const id = normalizeSubmissionId(data.id, "Apple notary status ID");
   if (id !== pending.submission.id || data.type !== "submissions") fail("Apple notary status identity is invalid");
   const name = boundedString(attributes.name, "Apple notary submission name", 255);
-  if (name !== pending.submission.artifact_name) fail("Apple notary submission name does not match the pending DMG");
+  if (name !== pending.submission.artifact_name) fail("Apple notary submission name does not match the pending artifact");
   const status = boundedString(attributes.status, "Apple notary status", 32);
   if (!APPLE_STATUSES.has(status)) fail(`Apple returned unknown notary status ${status}`);
   const createdDate = boundedString(attributes.createdDate, "Apple notary created date", 64);
@@ -395,9 +430,9 @@ function validateDeveloperLog(log, pending) {
   const jobId = normalizeSubmissionId(log.jobId, "Apple developer log job ID");
   if (jobId !== pending.submission.id) fail("Apple developer log job ID does not match the pending submission");
   if (log.status !== "Accepted") fail("Apple developer log does not report Accepted");
-  if (log.archiveFilename !== pending.submission.artifact_name) fail("Apple developer log archive name does not match the pending DMG");
+  if (log.archiveFilename !== pending.submission.artifact_name) fail("Apple developer log archive name does not match the pending artifact");
   if (typeof log.sha256 !== "string" || log.sha256.toLowerCase() !== pending.submission.sha256) {
-    fail("Apple developer log SHA-256 does not match the pending DMG");
+    fail("Apple developer log SHA-256 does not match the pending artifact");
   }
   const statusSummary = boundedString(log.statusSummary, "Apple developer log status summary", 1024);
   if (log.issues !== null && !Array.isArray(log.issues)) fail("Apple developer log issues must be null or an array");
@@ -492,7 +527,7 @@ async function retrieveAcceptedLog(options, pending, terminalStatus, deadline) {
     const log = parseJsonBuffer(logResponse.body, "Apple developer log", MAX_NOTARY_LOG_BYTES);
     const logSummary = validateDeveloperLog(log, pending);
     options.report(`Apple notarization ${pending.submission.id} log is downloaded and bound.`);
-    const logName = `rho-${pending.version}-macos-notary-log.json`;
+    const logName = expectedNotaryLogName(pending.version, recordArtifactKind(pending));
     const accepted = {
       ...commonRecord({
         source_repository: pending.source_repository,
@@ -502,7 +537,7 @@ async function retrieveAcceptedLog(options, pending, terminalStatus, deadline) {
         commit: pending.commit,
         run_id: pending.run_id,
         run_attempt: pending.run_attempt,
-      }, "accepted", "rho_macos_notary_accepted"),
+      }, "accepted", "rho_macos_notary_accepted", recordArtifactKind(pending)),
       submission: {
         ...pending.submission,
         created_date: terminalStatus.created_date,
@@ -593,10 +628,13 @@ export async function waitForAccepted(pendingInput, {
 
 export function validateAcceptedRecord(record, pendingInput, expected = {}) {
   const pending = validatePendingRecord(structuredClone(pendingInput), expected);
-  validateCommonRecord(record, "rho_macos_notary_accepted", "accepted");
+  const common = validateCommonRecord(record, "rho_macos_notary_accepted", "accepted");
   validateExpectedIdentity(record, expected);
   for (const key of ["source_repository", "build_mode", "version", "release_tag", "commit", "run_id", "run_attempt", "platform"]) {
     if (record[key] !== pending[key]) fail(`Accepted notary evidence ${key} does not match the pending record`);
+  }
+  if (common.artifact_kind !== recordArtifactKind(pending)) {
+    fail("Accepted notary evidence artifact kind does not match the pending record");
   }
   assertExactKeys(record.submission, [
     "id",
@@ -614,7 +652,9 @@ export function validateAcceptedRecord(record, pendingInput, expected = {}) {
     fail("Accepted submission status or date is invalid");
   }
   assertExactKeys(record.submission.log, ["name", "size_bytes", "sha256", "status_summary", "issue_count"], "Accepted log");
-  if (record.submission.log.name !== `rho-${record.version}-macos-notary-log.json`) fail("Accepted log name is invalid");
+  if (record.submission.log.name !== expectedNotaryLogName(record.version, common.artifact_kind)) {
+    fail("Accepted log name is invalid");
+  }
   if (!Number.isSafeInteger(record.submission.log.size_bytes) || record.submission.log.size_bytes <= 0 || record.submission.log.size_bytes > MAX_NOTARY_LOG_BYTES) {
     fail("Accepted log size is invalid");
   }
@@ -626,7 +666,7 @@ export function validateAcceptedRecord(record, pendingInput, expected = {}) {
   return record;
 }
 
-export function verifyFinalizerInputs({ pendingPath, acceptedPath, logPath, dmgPath, expected = {} }) {
+export function verifyFinalizerInputs({ pendingPath, acceptedPath, logPath, dmgPath, artifactPath, expected = {} }) {
   const pending = validatePendingRecord(readJsonFile(pendingPath, MAX_NOTARY_EVIDENCE_BYTES, "Pending notary evidence"), expected);
   const accepted = validateAcceptedRecord(
     readJsonFile(acceptedPath, MAX_NOTARY_EVIDENCE_BYTES, "Accepted notary evidence"),
@@ -640,11 +680,13 @@ export function verifyFinalizerInputs({ pendingPath, acceptedPath, logPath, dmgP
     fail("Apple developer log does not match accepted evidence");
   }
   validateDeveloperLog(parseJsonBuffer(logBytes, "Apple developer log", MAX_NOTARY_LOG_BYTES), pending);
-  const artifact = hashFile(dmgPath);
-  if (path.basename(dmgPath) !== pending.submission.artifact_name
+  const submittedArtifactPath = artifactPath ?? dmgPath;
+  if (!submittedArtifactPath) fail("Notary finalizer artifact is missing");
+  const artifact = hashFile(submittedArtifactPath);
+  if (path.basename(submittedArtifactPath) !== pending.submission.artifact_name
     || artifact.size_bytes !== pending.submission.size_bytes
     || artifact.sha256 !== pending.submission.sha256) {
-    fail("Submitted DMG does not match pending notary evidence");
+    fail("Submitted notarization artifact does not match pending notary evidence");
   }
   return { pending, accepted };
 }
@@ -680,13 +722,28 @@ function expectedFromArgs(args, includeRunAttempt = true) {
   return expected;
 }
 
+function artifactFromArgs(args) {
+  if (args.dmg && args.artifact) fail("Use either --dmg or --artifact, not both");
+  if (args.dmg) {
+    if (args.artifact_kind != null && args.artifact_kind !== "dmg") {
+      fail("--dmg requires the dmg artifact kind");
+    }
+    return { artifactPath: args.dmg, artifactKind: "dmg" };
+  }
+  return {
+    artifactPath: required(args, "artifact"),
+    artifactKind: required(args, "artifact_kind"),
+  };
+}
+
 async function main(argv) {
   const [mode, ...rest] = argv;
   const args = parseArgs(rest);
   if (mode === "submission") {
+    const artifact = artifactFromArgs(args);
     const pending = createPendingRecord({
       receiptPath: required(args, "receipt"),
-      dmgPath: required(args, "dmg"),
+      ...artifact,
       ...expectedFromArgs(args),
     });
     writeJsonExclusive(required(args, "output"), pending, "Pending notary evidence");
@@ -721,11 +778,12 @@ async function main(argv) {
     return;
   }
   if (mode === "verify") {
+    const artifact = artifactFromArgs(args);
     const verified = verifyFinalizerInputs({
       pendingPath: required(args, "pending"),
       acceptedPath: required(args, "accepted"),
       logPath: required(args, "log"),
-      dmgPath: required(args, "dmg"),
+      ...artifact,
       expected: expectedFromArgs(args, false),
     });
     process.stdout.write(`Verified immutable notarization inputs for ${verified.pending.submission.id}.\n`);

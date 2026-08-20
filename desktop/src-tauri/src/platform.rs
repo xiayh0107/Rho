@@ -59,6 +59,40 @@ pub fn rscript_picker_extension() -> Option<&'static str> {
     rscript_selection_spec(current_platform()).picker_extension
 }
 
+/// Short architecture requirement used in the stable `R_ARCH_MISMATCH`
+/// recovery detail (LIN4).
+pub fn r_architecture_requirement() -> &'static str {
+    r_architecture_requirement_for(current_platform())
+}
+
+fn r_architecture_requirement_for(platform: DesktopPlatform) -> &'static str {
+    match platform {
+        DesktopPlatform::Macos => "Rho for Apple Silicon requires arm64 R",
+        DesktopPlatform::Linux => "Rho for Linux x64 requires x86_64 R",
+        DesktopPlatform::Windows => "Rho requires a supported R architecture",
+    }
+}
+
+/// Full user-facing architecture requirement sentence used by the startup
+/// recovery copy (LIN4).
+pub fn r_architecture_requirement_message() -> &'static str {
+    r_architecture_requirement_message_for(current_platform())
+}
+
+fn r_architecture_requirement_message_for(platform: DesktopPlatform) -> &'static str {
+    match platform {
+        DesktopPlatform::Macos => {
+            "Rho for Apple Silicon requires an arm64 R 4.4 or later installation."
+        }
+        DesktopPlatform::Linux => {
+            "Rho for Linux x64 requires an x86_64 R 4.4 or later installation."
+        }
+        DesktopPlatform::Windows => {
+            "Rho requires an R 4.4 or later installation with a supported architecture."
+        }
+    }
+}
+
 fn open_url_spec(platform: DesktopPlatform, url: &str) -> CommandSpec {
     match platform {
         DesktopPlatform::Windows => CommandSpec {
@@ -220,6 +254,26 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn architecture_requirement_copy_is_platform_specific() {
+        assert_eq!(
+            r_architecture_requirement_for(DesktopPlatform::Macos),
+            "Rho for Apple Silicon requires arm64 R"
+        );
+        assert_eq!(
+            r_architecture_requirement_for(DesktopPlatform::Linux),
+            "Rho for Linux x64 requires x86_64 R"
+        );
+        assert_eq!(
+            r_architecture_requirement_message_for(DesktopPlatform::Linux),
+            "Rho for Linux x64 requires an x86_64 R 4.4 or later installation."
+        );
+        assert_eq!(
+            r_architecture_requirement_message_for(DesktopPlatform::Macos),
+            "Rho for Apple Silicon requires an arm64 R 4.4 or later installation."
+        );
     }
 
     #[test]

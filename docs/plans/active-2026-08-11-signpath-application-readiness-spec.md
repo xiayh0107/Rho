@@ -82,7 +82,10 @@ signature, candidate, tag, Release, or updater mutation.
    migration or deletion authority.
 3. Manual update behavior, endpoint/channel policy, bounds, timeout, URL
    allowlists, structured failure states, and user-initiated external browser
-   navigation remain unchanged.
+   navigation remain unchanged **within SP-READY1**. A later separately
+   activated signed-native-updater contract may extend the explicit-user
+   install action, but it cannot restore startup/background checks or weaken
+   this privacy boundary.
 4. `PRIVACY.md` is the public data/network contract. It must distinguish local
    project/application data from user-initiated remote operations, describe OS
    credential storage and custom Base URL risk, state retention/deletion
@@ -133,9 +136,12 @@ signature, candidate, tag, Release, or updater mutation.
   mutation. SP-READY1 cannot satisfy those gates.
 
 No schema, project identity, approval table, Provider format, credential
-format, R package contract, or public updater manifest changes. Cross-review
-found no unresolved state, persistence, approval, or mutation ownership
-collision after the manual-only amendment above.
+format, R package contract, or public updater manifest changes occur in
+SP-READY1. A separately activated native-updater package owns any future
+distinct Tauri manifest and final-byte signing pipeline; it must preserve this
+manual-only network policy. Cross-review found no unresolved state,
+persistence, approval, or mutation ownership collision after the manual-only
+amendment above.
 
 ## Public Privacy Contract
 
@@ -368,6 +374,22 @@ The already audited `dev.38` Draft remains immutable and unpublished because
 its reviewed body requires ordinary human acceptance. CPREL1 uses a fresh
 `dev.39` request and artifacts, and adds only an actor-bound,
 public-prerelease-only schema-v2 decision plus public limitation disclosure.
+
+## 2026-08-17 Free Trial Two-Stage dev.42 Amendment
+
+The owner decided that Windows development prereleases will use the current
+SignPath Free Trial certificate for an extended period. Installed dev.41
+evidence proved the outer installer's test signature does not sign the
+installed `rho-desktop.exe`; PowerShell returned `NotSigned`. The strict
+`github-actions-rho-desktop-binary` artifact configuration now exists in the
+SignPath `rho` project. The active D4/R4 implementation and candidate contract
+is `active-2026-08-17-signpath-free-trial-two-stage-dev42-spec.md`.
+
+This amendment authorizes the two-stage topology with the Free Trial
+self-signed certificate while preserving truthful `UnknownError`/untrusted
+disclosure. It does not claim Foundation acceptance or production trust and
+does not weaken the future production certificate, trusted-build, MFA, or
+timestamp gates.
 
 ## Version, NEWS, And Release Decision
 
