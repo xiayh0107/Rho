@@ -16,3 +16,4 @@
 .worktrees/
 /test/generated-manual-fixtures/
 test/environment-demo/renv
+.reasonix

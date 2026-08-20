@@ -45,7 +45,7 @@ assert.match(main, /platform::rscript_picker_extension\(\)/);
 assert.match(main, /platform::rscript_display_name\(\)/);
 
 assert.match(cargo, /\[target\.'cfg\(target_os = "macos"\)'\.dependencies\][\s\S]*keyring = \{ version = "4\.1\.6", default-features = false, features = \["v1"\] \}/);
-assert.match(agent, /cfg\(any\(windows, target_os = "macos"\)\)/);
+assert.match(agent, /cfg\(any\(windows, target_os = "macos", target_os = "linux"\)\)/);
 assert.match(agent, /const SYSTEM_CREDENTIAL_STORE_LABEL: &str = "macOS Keychain"/);
 assert.match(agent, /macos_native_keychain_set_get_replace_delete_and_cleanup/);
 assert.match(agent, /ignore = "opt-in MAC3 smoke touches a unique disposable macOS Keychain entry"/);

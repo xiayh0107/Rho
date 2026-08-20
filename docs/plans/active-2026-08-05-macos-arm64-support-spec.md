@@ -177,12 +177,17 @@ Success requires all of the following facts to be recorded separately:
   release. No identity is hard-coded in the repository.
 - R support: retain the existing R 4.4 minimum and test the implementation-time
   current stable R as well. The first candidate accepts arm64 R only.
-- Updates: discovery and redirect only. No background installer download,
-  automatic replacement, delta update, or silent restart.
+- Updates: this MAC4/MAC5 package owns discovery and redirect only. No
+  background installer download, delta update, or silent restart is permitted
+  here. A later separately cross-reviewed native-updater contract may add an
+  explicit-user signed install/restart path only after it preserves Apple
+  signing, notarization, stapling, and exact-candidate acceptance.
 - No new public Workspace protocol, persistence schema, approval lane, shell
   execution authority, remote execution, or scientific behavior is introduced.
-- Linux, Intel macOS, App Store packaging, automatic update installation, and
-  executing user shell startup files are out of scope.
+- Linux, Intel macOS, App Store packaging, automatic update installation
+  **within this MAC package**, and executing user shell startup files are out
+  of scope. This does not authorize a native updater; the separately active
+  `2026-08-15-tauri-native-updater` contract must be activated first.
 
 ## Compatibility And Ownership
 
